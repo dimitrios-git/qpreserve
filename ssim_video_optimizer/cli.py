@@ -13,7 +13,7 @@ from .probes import probe_audio_streams, probe_video_framerate
 from .utils import build_audio_options, setup_logging
 from .sampling import extract_samples
 from .ssim_search import find_best_qp
-from .encoder import encode_final, measure_full_ssim
+from .encoder import encode_final
 
 
 def main():

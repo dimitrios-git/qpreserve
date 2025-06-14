@@ -22,19 +22,19 @@ def main():
     )
     parser.add_argument('input', help='Source video file')
     parser.add_argument('--ssim', type=float, default=0.99, help='Target SSIM')
-    parser.add_argument('--min-qp', dest='min_qp', type=int, default=19, help='Min QP')
-    parser.add_argument('--max-qp', dest='max_qp', type=int, default=32, help='Max QP')
+    parser.add_argument('--min-qp', dest='min_qp', type=int, default=16, help='Min QP')
+    parser.add_argument('--max-qp', dest='max_qp', type=int, default=34, help='Max QP')
     parser.add_argument('--sample-percent', type=float, default=15, help='Percent to sample')
     parser.add_argument('--sample-count', type=int, default=3, help='Num samples')
     parser.add_argument(
-        '--sample-qp', type=int, default=16, help='Sample re-encode QP'
+        '--sample-qp', type=int, default=15, help='Sample re-encode QP'
     )
     parser.add_argument(
         '--sampling-mode', choices=['uniform', 'scene', 'motion'],
         default='motion', help='Sampling strategy'
     )
     parser.add_argument(
-        '--metric', choices=['avg', 'min', 'max'], default='avg', help='SSIM metric'
+        '--metric', choices=['avg', 'min', 'max'], default='min', help='SSIM metric'
     )
     parser.add_argument('--log-file', help='Log file path')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')

@@ -105,6 +105,7 @@ def extract_samples(input_file: str, mode: str, percent: float, count: int, samp
         run_cmd(['ffmpeg', '-y', '-i', input_file, '-ss', str(t), '-t', str(clip_len), '-c', 'copy', seg])
         run_cmd([
             'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', seg,
+            '-map', '0', '-map_metadata', '0',
             '-r', str(raw_fr), '-g', str(int(max(1, round(raw_fr/2)))),
             '-bf', '2', '-pix_fmt', 'yuv420p', '-c:v', 'h264_nvenc',
             '-preset', 'p7', '-rc', 'constqp', '-qp', str(sample_qp)

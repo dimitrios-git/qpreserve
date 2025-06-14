@@ -27,6 +27,7 @@ def encode_final(input_file: str, qp: int, audio_opts: list, raw_fr: float, gop:
     # Run the encode with proper GOP
     run_cmd([
         'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', input_file,
+        '-map', '0', '-map_metadata', '0',
         '-r', str(raw_fr), '-g', str(gop), '-bf', '2',
         '-pix_fmt', 'yuv420p', '-c:v', 'h264_nvenc',
         '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)

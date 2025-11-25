@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -s nullglob
 
 ROOT="${1:-.}"
 
@@ -18,7 +19,14 @@ find "$ROOT" -type f | while read -r f; do
     # Detect converted versions:
     # Original:  Some Video.mp4
     # Converted: Some Video [h264_nvenc qp XX].mp4
-    already_done=$(find "$dir" -maxdepth 1 -type f -regex ".*/$name \[.*\]\.$ext" | head -n 1)
+    # Use -name with escaped brackets to avoid regex errors on braces/regex chars in $name.
+    # Look for a converted file that shares the same base name.
+    # Check for an existing converted file with the same base.
+    converted=( "$dir/$name [h264_nvenc qp "*"].$ext" )
+    already_done=""
+    if ((${#converted[@]} > 0)); then
+        already_done="${converted[0]}"
+    fi
 
     if [ -n "$already_done" ]; then
         echo "SKIP (already converted): $f"

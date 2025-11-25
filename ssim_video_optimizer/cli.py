@@ -225,67 +225,64 @@ def main():
         )
 
         # ------------------------------------------------------------
-        # STEP 4 — FULL-FILE FINAL ENCODE DESCENT (IMPROVED)
+        # STEP 4 — FULL-FILE FINAL ENCODE DESCENT (CLEANER OUTPUT)
         # ------------------------------------------------------------
+
         prev_file = None
         final_file = None
         final_qp = best_qp
 
-        # Usually only ONE full-file encode is needed
-        with tqdm(total=1, desc="Final full-file SSIM", unit="encode") as pbar:
-            for qp in range(best_qp, args.min_qp - 1, -1):
-                final_qp = qp
+        for qp in range(best_qp, args.min_qp - 1, -1):
+            final_qp = qp
+            print(f"\nChecking full-file quality at QP={qp}...")
 
-                # Cleanup old intermediate file
-                if prev_file and os.path.exists(prev_file):
-                    os.remove(prev_file)
+            # Clean up older intermediate file
+            if prev_file and os.path.exists(prev_file):
+                os.remove(prev_file)
 
-                # Full encode with progress + SSIM
-                output_path, ssim_val = encode_final(
-                    input_file=baseline_file,
-                    qp=final_qp,
-                    audio_opts=audio_opts,
-                    raw_fr=raw_fr,
-                    gop=gop,
-                    return_ssim=True,
-                    output_dir=tmpdir
-                )
+            # Encode full file (this has its own real FFmpeg progress bar)
+            output_path, ssim_val = encode_final(
+                input_file=baseline_file,
+                qp=qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                return_ssim=True,
+                output_dir=tmpdir
+            )
 
-                # one step of the bar for each full-file attempt
-                pbar.update(1)
+            print(f"  → SSIM={ssim_val:.4f}")
 
-                if ssim_val >= args.ssim:
-                    print(f"Final full-file SSIM {ssim_val:.4f} meets target; using QP={final_qp}")
-                    final_file = output_path
-                    break
+            if ssim_val >= args.ssim:
+                print(f"  ✓ Meets target SSIM ≥ {args.ssim}; accepting QP={qp}")
+                final_file = output_path
+                break
 
-                prev_file = output_path
+            print("  ✗ Below target; trying lower QP...")
+            prev_file = output_path
 
-            else:
-                # None met threshold → fallback to best_qp result
-                logging.warning(
-                    "Could not meet SSIM target; using sample-based QP=%d",
-                    best_qp
-                )
-                final_file = prev_file or encode_final(
-                    input_file=baseline_file,
-                    qp=best_qp,
-                    audio_opts=audio_opts,
-                    raw_fr=raw_fr,
-                    gop=gop,
-                    return_ssim=False,
-                    output_dir=tmpdir
-                )
-                final_qp = best_qp
+        else:
+            # If loop never broke (none passed threshold)
+            logging.warning(
+                "Could not meet SSIM target; using sample-based QP=%d",
+                best_qp
+            )
+            final_file = prev_file or encode_final(
+                input_file=baseline_file,
+                qp=best_qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                return_ssim=False,
+                output_dir=tmpdir
+            )
+            final_qp = best_qp
 
         # ------------------------------------------------------------
         # STEP 5 — MOVE FINAL RESULT TO SOURCE DIRECTORY
         # ------------------------------------------------------------
-        base, ext = os.path.splitext(os.path.basename(args.input))
-        dest = os.path.join(
-            os.path.dirname(args.input),
-            f"{base} [h264_nvenc qp {final_qp}]{ext}"
-        )
+        dest_name = os.path.basename(final_file)
+        dest = os.path.join(os.path.dirname(args.input), dest_name)
 
         shutil.move(final_file, dest)
         print(f"Optimized file: {dest} (QP={final_qp})")

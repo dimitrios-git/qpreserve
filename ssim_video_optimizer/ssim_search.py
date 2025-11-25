@@ -16,7 +16,7 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
 
     run_cmd([
         'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', sample_file,
-        '-map', '0', '-map_metadata', '0',
+        '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
         '-r', str(raw_fr), '-g', str(gop), '-bf', '2', '-pix_fmt', 'yuv420p',
         '-c:v', 'h264_nvenc', '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)
     ] + audio_opts + ['-c:s', 'copy', temp_out])

@@ -199,10 +199,10 @@ def extract_samples(
             seg
         ])
 
-        # Encode sample
+        # Encode sample with explicit stream mapping
         run_cmd([
             'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', seg,
-            '-map', '0', '-map_metadata', '0',
+            '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
             '-r', str(raw_fr), '-g', str(int(max(1, round(raw_fr / 2)))),
             '-bf', '2', '-pix_fmt', 'yuv420p', '-c:v', 'h264_nvenc',
             '-preset', 'p7', '-rc', 'constqp', '-qp', str(sample_qp)

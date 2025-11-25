@@ -1,7 +1,10 @@
 # utils.py
 
-import subprocess
 import logging
+import os
+import subprocess
+import tempfile
+
 from tqdm import tqdm
 
 # ────────────────────────────────────────────────
@@ -63,10 +66,20 @@ def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
 
     logging.debug("Running FFmpeg (with progress): %s", " ".join(progress_cmd))
 
+    # Capture stderr to a temp file so we can surface the reason on failures.
+    log_file = tempfile.NamedTemporaryFile(
+        prefix="ffmpeg_progress_",
+        suffix=".log",
+        delete=False,
+        mode="w+",
+        encoding="utf-8"
+    )
+    log_path = log_file.name
+
     process = subprocess.Popen(
         progress_cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=log_file,
         text=True,
         bufsize=1
     )
@@ -89,9 +102,20 @@ def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
 
     process.wait()
     pbar.close()
+    log_file.flush()
+    log_file.close()
 
     if process.returncode != 0:
-        raise subprocess.CalledProcessError(process.returncode, progress_cmd)
+        logging.error("FFmpeg failed (code=%s). Full log: %s", process.returncode, log_path)
+        err = subprocess.CalledProcessError(process.returncode, progress_cmd)
+        err.ffmpeg_log = log_path  # type: ignore[attr-defined]
+        raise err
+    else:
+        # Clean up the log on success
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
 
 
 # ────────────────────────────────────────────────

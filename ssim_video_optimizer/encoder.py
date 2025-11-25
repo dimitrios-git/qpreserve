@@ -1,6 +1,7 @@
 # encoder.py
 import os
-from .utils import run_cmd
+from .utils import run_cmd, run_ffmpeg_progress, parse_timestamp
+from .probes import probe_video_duration
 
 
 def measure_full_ssim(input_file: str, encoded_file: str) -> float:
@@ -8,32 +9,75 @@ def measure_full_ssim(input_file: str, encoded_file: str) -> float:
         'ffmpeg', '-i', input_file, '-i', encoded_file,
         '-filter_complex', 'ssim', '-f', 'null', '-'
     ], capture_output=True)
+
     for line in res.stderr.splitlines():
         if 'All:' in line:
             return float(line.split('All:')[1].split()[0])
     return 0.0
 
 
-def encode_final(input_file: str, qp: int, audio_opts: list, raw_fr: float, gop: int,
-                 return_ssim: bool=False, output_dir: str=None) -> "tuple[str, float] | str":
+def encode_baseline(input_file: str, output_dir: str | None = None) -> str:
     """
-    Encode the full input file at the specified QP and optionally return SSIM.
-    If output_dir is provided, writes the file there; otherwise in current dir.
-    Returns the path and SSIM (if return_ssim=True), else just path.
+    Step 0 + 1:
+    - Normalize pixel format / color tags
+    - Create a near-lossless baseline using NVENC QP=0
+    - With real FFmpeg progress
+    """
+    base, ext = os.path.splitext(os.path.basename(input_file))
+    filename = f"{base} [baseline qp 0]{ext}"
+    output = os.path.join(output_dir, filename) if output_dir else filename
+
+    total_duration = probe_video_duration(input_file)
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', input_file,
+        '-map', '0', '-map_metadata', '0',
+        '-pix_fmt', 'yuv420p',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
+        '-colorspace', 'bt709',
+        '-c:v', 'h264_nvenc',
+        '-preset', 'p7',
+        '-rc', 'constqp',
+        '-qp', '0',
+        '-bf', '2',
+        '-c:a', 'copy',
+        '-c:s', 'copy',
+        output
+    ]
+
+    run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
+    return output
+
+
+def encode_final(input_file: str, qp: int, audio_opts: list, raw_fr: float, gop: int,
+                 return_ssim: bool = False, output_dir: str | None = None):
+    """
+    Final encode with FFmpeg progress.
     """
     base, ext = os.path.splitext(os.path.basename(input_file))
     filename = f"{base} [h264_nvenc qp {qp}]{ext}"
-    final_file = os.path.join(output_dir, filename) if output_dir else filename
-    # Run the encode with proper GOP
-    run_cmd([
+    output = os.path.join(output_dir, filename) if output_dir else filename
+
+    total_duration = probe_video_duration(input_file)
+
+    cmd = [
         'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', input_file,
         '-map', '0', '-map_metadata', '0',
         '-r', str(raw_fr), '-g', str(gop), '-bf', '2',
-        '-pix_fmt', 'yuv420p', '-c:v', 'h264_nvenc',
-        '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)
-    ] + audio_opts + ['-c:s', 'copy', final_file])
+        '-pix_fmt', 'yuv420p',
+        '-c:v', 'h264_nvenc',
+        '-preset', 'p7',
+        '-rc', 'constqp',
+        '-qp', str(qp)
+    ] + audio_opts + ['-c:s', 'copy', output]
+
+    run_ffmpeg_progress(cmd, total_duration, desc=f"Final Encode (QP={qp})")
+
     if return_ssim:
-        full_ssim = measure_full_ssim(input_file, final_file)
-        print(f"Full-file SSIM at QP {qp}: {full_ssim:.4f}")
-        return final_file, full_ssim
-    return final_file
+        ssim_val = measure_full_ssim(input_file, output)
+        print(f"Full-file SSIM at QP {qp}: {ssim_val:.4f}")
+        return output, ssim_val
+
+    return output

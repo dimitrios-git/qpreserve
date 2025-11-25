@@ -228,6 +228,8 @@ def main():
         # STEP 4 — FULL-FILE FINAL ENCODE DESCENT (CLEANER OUTPUT)
         # ------------------------------------------------------------
 
+        source_base, source_ext = os.path.splitext(os.path.basename(args.input))
+
         prev_file = None
         final_file = None
         final_qp = best_qp
@@ -248,8 +250,16 @@ def main():
                 raw_fr=raw_fr,
                 gop=gop,
                 return_ssim=True,
-                output_dir=tmpdir
+                output_dir=tmpdir,
+                output_base=source_base,
+                output_ext=source_ext,
             )
+
+            if ssim_val is None:
+                logging.warning("Full-file SSIM unavailable at QP=%d; keeping this encode.", qp)
+                final_file = output_path
+                final_qp = qp
+                break
 
             print(f"  → SSIM={ssim_val:.4f}")
 
@@ -274,9 +284,15 @@ def main():
                 raw_fr=raw_fr,
                 gop=gop,
                 return_ssim=False,
-                output_dir=tmpdir
+                output_dir=tmpdir,
+                output_base=source_base,
+                output_ext=source_ext,
             )
             final_qp = best_qp
+
+        if final_file is None:
+            logging.error("Final encode failed; no output produced.")
+            return
 
         # ------------------------------------------------------------
         # STEP 5 — MOVE FINAL RESULT TO SOURCE DIRECTORY

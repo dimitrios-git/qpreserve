@@ -12,19 +12,79 @@ from .probes import (
 )
 
 
-def measure_full_ssim(input_file: str, encoded_file: str) -> float:
+def measure_full_ssim(input_file: str, encoded_file: str) -> float | None:
     """
     Measure full-file SSIM between input_file (reference) and encoded_file (distorted).
+    Returns None if parsing fails or SSIM is invalid.
     """
-    res = run_cmd([
-        'ffmpeg', '-i', input_file, '-i', encoded_file,
-        '-filter_complex', 'ssim', '-f', 'null', '-'
-    ], capture_output=True)
 
-    for line in res.stderr.splitlines():
-        if 'All:' in line:
-            return float(line.split('All:')[1].split()[0])
-    return 0.0
+    def _parse_ssim(text: str) -> float | None:
+        for line in text.splitlines():
+            if 'All:' in line:
+                try:
+                    return float(line.split('All:')[1].split()[0])
+                except (ValueError, IndexError):
+                    return None
+        return None
+
+    def _measure(extra=None):
+        cmd = ['ffmpeg', '-nostdin']
+        if extra:
+            cmd += extra
+        cmd += [
+            '-i', input_file, '-i', encoded_file,
+            '-filter_complex', 'ssim', '-f', 'null', '-'
+        ]
+        res_local = run_cmd(cmd, capture_output=True)
+        val = _parse_ssim(res_local.stderr or "")
+        if val is None:
+            val = _parse_ssim(res_local.stdout or "")
+        return val, res_local
+
+    val = None
+    res = None
+    res_fb = None
+
+    try:
+        val, res = _measure()
+    except Exception as e:
+        logging.warning("Full-file SSIM command failed for %s (%s); retrying verbose.", encoded_file, e)
+
+    if val is None or val <= 0:
+        try:
+            val_fb, res_fb = _measure(extra=['-v', 'info'])
+            if val_fb is not None and val_fb > 0:
+                return val_fb
+        except Exception as e:
+            logging.warning("Fallback full-file SSIM failed for %s (%s).", encoded_file, e)
+
+    if val is not None and val > 0:
+        return val
+
+    # Persist logs to aid debugging
+    import tempfile
+    log_file = tempfile.NamedTemporaryFile(prefix="full_ssim_", suffix=".log", delete=False, mode="w", encoding="utf-8")
+    if res and res.stderr:
+        log_file.write("PRIMARY STDERR:\n")
+        log_file.write(res.stderr)
+        log_file.write("\n")
+    if res and res.stdout:
+        log_file.write("PRIMARY STDOUT:\n")
+        log_file.write(res.stdout)
+        log_file.write("\n")
+    if res_fb and res_fb.stderr:
+        log_file.write("FALLBACK STDERR:\n")
+        log_file.write(res_fb.stderr)
+        log_file.write("\n")
+    if res_fb and res_fb.stdout:
+        log_file.write("FALLBACK STDOUT:\n")
+        log_file.write(res_fb.stdout)
+        log_file.write("\n")
+    log_path = log_file.name
+    log_file.close()
+
+    logging.warning("Could not parse full-file SSIM for %s; treating as unavailable. See log: %s", encoded_file, log_path)
+    return None
 
 
 def build_hdr_sdr_filter(hdr: dict) -> str | None:
@@ -196,7 +256,9 @@ def encode_final(
     raw_fr: float,
     gop: int,
     return_ssim: bool = False,
-    output_dir: str | None = None
+    output_dir: str | None = None,
+    output_base: str | None = None,
+    output_ext: str | None = None,
 ):
     """
     Final encode (from the baseline file), with FFmpeg progress and optional SSIM.
@@ -206,7 +268,9 @@ def encode_final(
     - For higher-res baselines, use h264_nvenc -qp {qp}.
     """
 
-    base, ext = os.path.splitext(os.path.basename(input_file))
+    base_in, ext_in = os.path.splitext(os.path.basename(input_file))
+    base = output_base or base_in
+    ext = output_ext or ext_in
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
 
@@ -251,7 +315,10 @@ def encode_final(
 
     if return_ssim:
         ssim_val = measure_full_ssim(input_file, output)
-        print(f"Full-file SSIM at QP {qp}: {ssim_val:.4f}")
+        if ssim_val is not None:
+            print(f"Full-file SSIM at QP {qp}: {ssim_val:.4f}")
+        else:
+            print(f"Full-file SSIM at QP {qp}: unavailable")
         return output, ssim_val
 
     return output

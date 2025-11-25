@@ -2,20 +2,18 @@
 
 import subprocess
 import logging
-import re
 from tqdm import tqdm
 
-
 # ────────────────────────────────────────────────
-# BASIC SIMPLE COMMAND RUNNER (used where progress NOT needed)
+# BASIC SIMPLE COMMAND RUNNER
 # ────────────────────────────────────────────────
 
 def run_cmd(cmd, capture_output=False):
     """
-    Original run_cmd used for ffprobe calls, SSIM evaluation,
-    sample encoding, and any non-progress ffmpeg invocation.
+    Basic command runner used for ffprobe calls, SSIM evaluation,
+    sample encoding, etc., where progress is NOT needed.
     """
-    logging.debug(f"Running command: %s", " ".join(str(c) for c in cmd))
+    logging.debug("Running command: %s", " ".join(str(c) for c in cmd))
     return subprocess.run(
         cmd,
         check=True,
@@ -26,7 +24,7 @@ def run_cmd(cmd, capture_output=False):
 
 
 # ────────────────────────────────────────────────
-# TIMESTAMP PARSER
+# TIMESTAMP PARSER (for -progress out_time)
 # ────────────────────────────────────────────────
 
 def parse_timestamp(ts: str) -> float:
@@ -42,7 +40,7 @@ def parse_timestamp(ts: str) -> float:
 
 
 # ────────────────────────────────────────────────
-# PROGRESS-ENABLED FFMPEG RUNNER (Option B implementation)
+# PROGRESS-ENABLED FFMPEG RUNNER
 # ────────────────────────────────────────────────
 
 def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
@@ -54,7 +52,7 @@ def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
     desc: label for tqdm
     """
 
-    # Inject before the first "-i"
+    # Inject -progress pipe:1 -nostats before first "-i"
     progress_cmd = []
     inserted = False
     for token in cmd:
@@ -63,7 +61,7 @@ def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
             inserted = True
         progress_cmd.append(token)
 
-    logging.debug(f"Running FFmpeg (with progress): {' '.join(progress_cmd)}")
+    logging.debug("Running FFmpeg (with progress): %s", " ".join(progress_cmd))
 
     process = subprocess.Popen(
         progress_cmd,
@@ -97,7 +95,7 @@ def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
 
 
 # ────────────────────────────────────────────────
-# AUDIO STREAM LOGIC (FROM ORIGINAL FILE)
+# AUDIO STREAM LOGIC
 # ────────────────────────────────────────────────
 
 def build_audio_options(streams: list) -> list:
@@ -125,7 +123,7 @@ def build_audio_options(streams: list) -> list:
 
 
 # ────────────────────────────────────────────────
-# LOGGING SETUP (FROM ORIGINAL FILE)
+# LOGGING SETUP
 # ────────────────────────────────────────────────
 
 def setup_logging(verbose: bool, log_file: str = None):
@@ -139,3 +137,27 @@ def setup_logging(verbose: bool, log_file: str = None):
         format='%(asctime)s %(message)s',
         handlers=handlers
     )
+
+
+# ────────────────────────────────────────────────
+# FFMPEG FILTER DETECTION (for libvmaf, ssim, etc.)
+# ────────────────────────────────────────────────
+
+_FILTER_TEXT_CACHE: str | None = None
+
+def _ffmpeg_filters_text() -> str:
+    global _FILTER_TEXT_CACHE
+    if _FILTER_TEXT_CACHE is None:
+        # -hide_banner avoids tons of noise
+        res = run_cmd(['ffmpeg', '-hide_banner', '-filters'], capture_output=True)
+        _FILTER_TEXT_CACHE = res.stdout or ""
+    return _FILTER_TEXT_CACHE
+
+
+def has_filter(name: str) -> bool:
+    """
+    Return True if ffmpeg has a filter with `name` in its filter list.
+    This is a simple substring search, good enough for 'ssim', 'libvmaf', etc.
+    """
+    text = _ffmpeg_filters_text()
+    return name in text

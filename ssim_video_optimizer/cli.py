@@ -85,6 +85,16 @@ def main():
     parser.add_argument('--log-file', help='Optional log file path.')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Enable verbose logging.')
+    parser.add_argument(
+        '--scratch-dir',
+        help='Directory to store temporary baseline/final files (defaults to system temp). '
+             'Use a disk-backed path to avoid filling a tmpfs /tmp.'
+    )
+    parser.add_argument(
+        '--skip-full-ssim',
+        action='store_true',
+        help='Skip full-file SSIM verification step (use sample-based QP only).'
+    )
 
     args = parser.parse_args()
 
@@ -182,8 +192,28 @@ def main():
     # ------------------------------------------------------------
     # Prepare temp directories
     # ------------------------------------------------------------
-    baseline_tmp = tempfile.mkdtemp(prefix="ssim_baseline_")
-    tmpdir = tempfile.mkdtemp(prefix="ssim_final_")
+    scratch_root = args.scratch_dir or os.environ.get("SSIM_SCRATCH_DIR")
+    if scratch_root:
+        os.makedirs(scratch_root, exist_ok=True)
+    scratch_root = scratch_root or tempfile.gettempdir()
+
+    # Warn if scratch space looks too small (baseline + final + samples ~ 2.5x input size)
+    try:
+        input_size = os.path.getsize(args.input)
+        needed = int(input_size * 2.5)
+        free = shutil.disk_usage(scratch_root).free
+        if free < needed:
+            print(
+                f"WARNING: scratch dir '{scratch_root}' has {free/1e9:.1f} GB free; "
+                f"estimated need ~{needed/1e9:.1f} GB. "
+                "Use --scratch-dir to point to a disk-backed location."
+            )
+    except OSError:
+        pass
+
+    baseline_tmp = tempfile.mkdtemp(prefix="ssim_baseline_", dir=scratch_root)
+    tmpdir = tempfile.mkdtemp(prefix="ssim_final_", dir=scratch_root)
+    print(f"Scratch directory: {scratch_root}")
 
     try:
         # ------------------------------------------------------------
@@ -233,50 +263,9 @@ def main():
         final_file: str | None = None
         final_qp = best_qp
 
-        for qp in range(best_qp, args.min_qp - 1, -1):
-            final_qp = qp
-            print(f"\nChecking full-file quality at QP={qp}...")
-
-            # Clean up older intermediate file
-            if prev_file and os.path.exists(prev_file):
-                os.remove(prev_file)
-
-            # Encode full file (this has its own real FFmpeg progress bar)
-            output_path, ssim_val = encode_final(
-                input_file=baseline_file,
-                qp=qp,
-                audio_opts=audio_opts,
-                raw_fr=raw_fr,
-                gop=gop,
-                return_ssim=True,
-                output_dir=tmpdir,
-                output_base=source_base,
-                output_ext=source_ext,
-            )
-
-            if ssim_val is None:
-                logging.warning("Full-file SSIM unavailable at QP=%d; keeping this encode.", qp)
-                final_file = output_path
-                final_qp = qp
-                break
-
-            print(f"  → SSIM={ssim_val:.4f}")
-
-            if ssim_val >= args.ssim:
-                print(f"  ✓ Meets target SSIM ≥ {args.ssim}; accepting QP={qp}")
-                final_file = output_path
-                break
-
-            print("  ✗ Below target; trying lower QP...")
-            prev_file = output_path
-
-        else:
-            # If loop never broke (none passed threshold)
-            logging.warning(
-                "Could not meet SSIM target; using sample-based QP=%d",
-                best_qp
-            )
-            final_file = prev_file or cast(
+        if args.skip_full_ssim:
+            print("\nSkipping full-file SSIM verification; encoding once at sample-derived QP.")
+            final_file = cast(
                 str,
                 encode_final(
                     input_file=baseline_file,
@@ -288,16 +277,80 @@ def main():
                     output_dir=tmpdir,
                     output_base=source_base,
                     output_ext=source_ext,
-                )
+                ),
             )
             final_qp = best_qp
+        else:
+            for qp in range(best_qp, args.min_qp - 1, -1):
+                final_qp = qp
+                print(f"\nChecking full-file quality at QP={qp}...")
+
+                # Clean up older intermediate file
+                if prev_file and os.path.exists(prev_file):
+                    os.remove(prev_file)
+
+                # Encode full file (this has its own real FFmpeg progress bar)
+                output_path, ssim_val = cast(
+                    tuple[str, float | None],
+                    encode_final(
+                        input_file=baseline_file,
+                        qp=qp,
+                        audio_opts=audio_opts,
+                        raw_fr=raw_fr,
+                        gop=gop,
+                        return_ssim=True,
+                        output_dir=tmpdir,
+                        output_base=source_base,
+                        output_ext=source_ext,
+                    ),
+                )
+                # output_path is str, ssim_val is Optional[float]
+                output_path_str: str = output_path
+                ssim_val_opt: float | None = ssim_val
+                if ssim_val_opt is None:
+                    logging.warning("Full-file SSIM unavailable at QP=%d; keeping this encode.", qp)
+                    final_file = output_path_str
+                    final_qp = qp
+                    break
+
+                print(f"  → SSIM={ssim_val_opt:.4f}")
+
+                if ssim_val_opt >= args.ssim:
+                    print(f"  ✓ Meets target SSIM ≥ {args.ssim}; accepting QP={qp}")
+                    final_file = output_path_str
+                    break
+
+                print("  ✗ Below target; trying lower QP...")
+                prev_file = output_path_str
+
+            if final_file is None:
+                # If loop never broke (none passed threshold)
+                logging.warning(
+                    "Could not meet SSIM target; using sample-based QP=%d",
+                    best_qp
+                )
+                final_file = prev_file or cast(
+                    str,
+                    encode_final(
+                        input_file=baseline_file,
+                        qp=best_qp,
+                        audio_opts=audio_opts,
+                        raw_fr=raw_fr,
+                        gop=gop,
+                        return_ssim=False,
+                        output_dir=tmpdir,
+                        output_base=source_base,
+                        output_ext=source_ext,
+                    )
+                )
+                final_qp = best_qp
 
         # ------------------------------------------------------------
         # STEP 5 — MOVE FINAL RESULT TO SOURCE DIRECTORY
         # ------------------------------------------------------------
-        final_path = final_file
-        dest_name = os.path.basename(final_path)
-        dest = os.path.join(os.path.dirname(args.input), dest_name)
+        final_path: str = final_file
+        dest_name: str = os.path.basename(final_path)
+        dest: str = os.path.join(os.path.dirname(args.input), dest_name)
 
         shutil.move(final_path, dest)
         print(f"Optimized file: {dest} (QP={final_qp})")

@@ -14,8 +14,7 @@ import logging
 import os
 import tempfile
 import shutil
-
-from tqdm import tqdm
+from typing import Any, Dict, List, cast
 
 from .probes import (
     probe_audio_streams,
@@ -101,12 +100,12 @@ def main():
     # ------------------------------------------------------------
     # Probe basic video info (for impossible-encode checks)
     # ------------------------------------------------------------
-    vinfo = probe_video_stream_info(args.input)
-    width = vinfo['width']
-    height = vinfo['height']
-    pix_fmt = vinfo['pix_fmt']
+    vinfo: Dict[str, Any] = probe_video_stream_info(args.input)
+    width: int = int(vinfo['width'])
+    height: int = int(vinfo['height'])
+    pix_fmt: str = str(vinfo['pix_fmt'])
 
-    problems = []
+    problems: List[str] = []
 
     # Conservative H.264/NVENC safe bounds
     if width > 4096 or height > 4096:
@@ -176,9 +175,9 @@ def main():
     # ------------------------------------------------------------
     # Probe audio/video from original file
     # ------------------------------------------------------------
-    streams = probe_audio_streams(args.input)
-    audio_opts = build_audio_options(streams)
-    raw_fr = probe_video_framerate(args.input)
+    streams: List[Dict[str, Any]] = probe_audio_streams(args.input)
+    audio_opts: List[str] = build_audio_options(streams)
+    raw_fr: float = probe_video_framerate(args.input)
 
     # ------------------------------------------------------------
     # Prepare temp directories
@@ -196,7 +195,7 @@ def main():
         # ------------------------------------------------------------
         # STEP 2 — SAMPLE CLIP EXTRACTION
         # ------------------------------------------------------------
-        samples = extract_samples(
+        samples: List[str] = extract_samples(
             baseline_file,
             percent=args.sample_percent,
             count=args.sample_count,
@@ -230,8 +229,8 @@ def main():
 
         source_base, source_ext = os.path.splitext(os.path.basename(args.input))
 
-        prev_file = None
-        final_file = None
+        prev_file: str | None = None
+        final_file: str | None = None
         final_qp = best_qp
 
         for qp in range(best_qp, args.min_qp - 1, -1):
@@ -277,30 +276,30 @@ def main():
                 "Could not meet SSIM target; using sample-based QP=%d",
                 best_qp
             )
-            final_file = prev_file or encode_final(
-                input_file=baseline_file,
-                qp=best_qp,
-                audio_opts=audio_opts,
-                raw_fr=raw_fr,
-                gop=gop,
-                return_ssim=False,
-                output_dir=tmpdir,
-                output_base=source_base,
-                output_ext=source_ext,
+            final_file = prev_file or cast(
+                str,
+                encode_final(
+                    input_file=baseline_file,
+                    qp=best_qp,
+                    audio_opts=audio_opts,
+                    raw_fr=raw_fr,
+                    gop=gop,
+                    return_ssim=False,
+                    output_dir=tmpdir,
+                    output_base=source_base,
+                    output_ext=source_ext,
+                )
             )
             final_qp = best_qp
-
-        if final_file is None:
-            logging.error("Final encode failed; no output produced.")
-            return
 
         # ------------------------------------------------------------
         # STEP 5 — MOVE FINAL RESULT TO SOURCE DIRECTORY
         # ------------------------------------------------------------
-        dest_name = os.path.basename(final_file)
+        final_path = final_file
+        dest_name = os.path.basename(final_path)
         dest = os.path.join(os.path.dirname(args.input), dest_name)
 
-        shutil.move(final_file, dest)
+        shutil.move(final_path, dest)
         print(f"Optimized file: {dest} (QP={final_qp})")
 
     finally:

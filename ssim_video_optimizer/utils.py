@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from typing import Any, Dict, List, Sequence, Optional
 
 from tqdm import tqdm
 
@@ -11,7 +12,7 @@ from tqdm import tqdm
 # BASIC SIMPLE COMMAND RUNNER
 # ────────────────────────────────────────────────
 
-def run_cmd(cmd, capture_output=False):
+def run_cmd(cmd: Sequence[Any], capture_output: bool = False) -> subprocess.CompletedProcess[str]:
     """
     Basic command runner used for ffprobe calls, SSIM evaluation,
     sample encoding, etc., where progress is NOT needed.
@@ -46,7 +47,7 @@ def parse_timestamp(ts: str) -> float:
 # PROGRESS-ENABLED FFMPEG RUNNER
 # ────────────────────────────────────────────────
 
-def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
+def run_ffmpeg_progress(cmd: Sequence[Any], total_duration: float, desc: str = "Processing"):
     """
     Run FFmpeg with real-time progress using:
         ffmpeg -progress pipe:1 -nostats
@@ -56,7 +57,7 @@ def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
     """
 
     # Inject -progress pipe:1 -nostats before first "-i"
-    progress_cmd = []
+    progress_cmd: List[str] = []
     inserted = False
     for token in cmd:
         if not inserted and token == "-i":
@@ -87,18 +88,19 @@ def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
     pbar = tqdm(total=total_duration, desc=desc, unit="s")
     last_time = 0.0
 
-    for line in process.stdout:
-        line = line.strip()
+    if process.stdout:
+        for line in process.stdout:
+            line = line.strip()
 
-        if line.startswith("out_time="):
-            ts = line.split("=", 1)[1]
-            sec = parse_timestamp(ts)
-            if sec > last_time:
-                pbar.update(sec - last_time)
-                last_time = sec
+            if line.startswith("out_time="):
+                ts = line.split("=", 1)[1]
+                sec = parse_timestamp(ts)
+                if sec > last_time:
+                    pbar.update(sec - last_time)
+                    last_time = sec
 
-        elif line == "progress=end":
-            break
+            elif line == "progress=end":
+                break
 
     process.wait()
     pbar.close()
@@ -122,13 +124,13 @@ def run_ffmpeg_progress(cmd, total_duration: float, desc="Processing"):
 # AUDIO STREAM LOGIC
 # ────────────────────────────────────────────────
 
-def build_audio_options(streams: list) -> list:
+def build_audio_options(streams: List[Dict[str, Any]]) -> List[str]:
     """
     Build FFmpeg audio options for all audio streams.
     - If stream is AAC → copy
     - Otherwise → re-encode to AAC at 64 kbps per channel
     """
-    opts = []
+    opts: List[str] = []
     for i, s in enumerate(streams):
         codec = s.get('codec_name', '')
         ch = int(s.get('channels') or 2)
@@ -150,9 +152,9 @@ def build_audio_options(streams: list) -> list:
 # LOGGING SETUP
 # ────────────────────────────────────────────────
 
-def setup_logging(verbose: bool, log_file: str = None):
-    handlers = []
-    if log_file:
+def setup_logging(verbose: bool, log_file: Optional[str] = None):
+    handlers: List[logging.Handler] = []
+    if log_file is not None:
         handlers.append(logging.FileHandler(log_file))
     if verbose:
         handlers.append(logging.StreamHandler())
@@ -167,15 +169,15 @@ def setup_logging(verbose: bool, log_file: str = None):
 # FFMPEG FILTER DETECTION (for libvmaf, ssim, etc.)
 # ────────────────────────────────────────────────
 
-_FILTER_TEXT_CACHE: str | None = None
+_filter_text_cache: Optional[str] = None
 
 def _ffmpeg_filters_text() -> str:
-    global _FILTER_TEXT_CACHE
-    if _FILTER_TEXT_CACHE is None:
+    global _filter_text_cache
+    if _filter_text_cache is None:
         # -hide_banner avoids tons of noise
         res = run_cmd(['ffmpeg', '-hide_banner', '-filters'], capture_output=True)
-        _FILTER_TEXT_CACHE = res.stdout or ""
-    return _FILTER_TEXT_CACHE
+        _filter_text_cache = res.stdout or ""
+    return _filter_text_cache or ""
 
 
 def has_filter(name: str) -> bool:

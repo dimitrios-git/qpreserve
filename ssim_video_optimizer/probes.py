@@ -1,5 +1,6 @@
 # probes.py
 import json
+from typing import Any, Dict, List
 from .utils import run_cmd
 
 
@@ -30,7 +31,7 @@ def probe_video_duration(input_file: str) -> float:
     return float(data['format']['duration'])
 
 
-def probe_audio_streams(input_file: str) -> list:
+def probe_audio_streams(input_file: str) -> List[Dict[str, Any]]:
     res = run_cmd([
         'ffprobe', '-v', 'quiet',
         '-show_entries', 'stream=index,codec_type,codec_name,channels',
@@ -42,7 +43,7 @@ def probe_audio_streams(input_file: str) -> list:
     return data.get('streams', [])
 
 
-def detect_hdr(input_file: str) -> dict:
+def detect_hdr(input_file: str) -> Dict[str, Any]:
     """
     Returns:
         {
@@ -83,7 +84,7 @@ def detect_hdr(input_file: str) -> dict:
     }
 
 
-def probe_video_stream_info(input_file: str) -> dict:
+def probe_video_stream_info(input_file: str) -> Dict[str, Any]:
     """
     Return width, height, pix_fmt of the first video stream.
     """

@@ -2,6 +2,7 @@
 import os
 import tempfile
 from pathlib import Path
+from typing import List
 
 from .probes import probe_video_duration
 from .utils import run_cmd
@@ -37,7 +38,7 @@ def _detect_scene_times(input_file: str, threshold: float) -> list[float]:
         capture_output=True
     )
 
-    times: list[float] = []
+    times: List[float] = []
     for line in res.stderr.splitlines():
         # Typical showinfo line contains 'showinfo' and 'pts_time:'
         if 'showinfo' in line and 'pts_time:' in line:
@@ -51,7 +52,7 @@ def _detect_scene_times(input_file: str, threshold: float) -> list[float]:
     return times
 
 
-def _pick_from_candidates(candidates: list[float], count: int, duration: float, clip_len: float) -> list[float]:
+def _pick_from_candidates(candidates: List[float], count: int, duration: float, clip_len: float) -> list[float]:
     """
     Given a sorted list of candidate times, pick `count` of them
     spread across the list, enforcing that they fit in [0, duration - clip_len].
@@ -70,7 +71,7 @@ def _pick_from_candidates(candidates: list[float], count: int, duration: float, 
 
     # Spread picks across the candidate list
     step = len(candidates) / float(count)
-    picked = []
+    picked: List[float] = []
     for i in range(count):
         idx = int(round(i * step))
         if idx >= len(candidates):
@@ -103,7 +104,7 @@ def select_sample_times(
 
     span = duration * percent / 100.0
     step = max((duration - span) / max(count - 1, 1), 0)
-    uniform_times = [i * step for i in range(count)]
+    uniform_times: List[float] = [i * step for i in range(count)]
 
     if clip_len is None:
         clip_len = span / count if count > 0 else 0.0
@@ -134,7 +135,7 @@ def select_sample_times(
                 base_times = uniform_times
 
     # Ensure spacing at least clip_len and clamp within duration
-    filtered: list[float] = []
+    filtered: List[float] = []
     for t in base_times:
         t_clamped = max(0.0, min(t, max(duration - clip_len, 0)))
         if all(abs(t_clamped - prev) >= clip_len for prev in filtered):
@@ -159,7 +160,7 @@ def extract_samples(
     percent: float,
     count: int,
     sample_qp: int,
-    audio_opts: list,
+    audio_opts: list[str],
     raw_fr: float,
     sampling_mode: str = 'uniform'
 ) -> list[str]:

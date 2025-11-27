@@ -1,14 +1,16 @@
 # ssim_search.py
 import logging
 import os
+import subprocess
 from statistics import mean
+from typing import List, Sequence, Tuple
 
 from .utils import run_cmd
 
 from tqdm import tqdm
 
 
-def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, audio_opts: list) -> float:
+def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, audio_opts: List[str]) -> float:
     """
     Re-encode a sample at the given QP (with the proper GOP) and measure SSIM against the original.
     """
@@ -39,9 +41,10 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
                     return None
         return None
 
-    def _measure(cmd_extra=None):
-        cmd = [
-            'ffmpeg', '-nostdin',
+    def _measure(cmd_extra: Sequence[str] | None = None) -> Tuple[float | None, subprocess.CompletedProcess[str]]:
+        # Keep SSIM probe lightweight to reduce OOM risk.
+        cmd: List[str] = [
+            'ffmpeg', '-nostdin', '-threads', '1', '-an', '-sn',
             '-i', sample_file,
             '-i', temp_out,
             '-filter_complex', 'ssim',
@@ -49,7 +52,7 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
         ]
         if cmd_extra:
             # Insert extra options after ffmpeg
-            cmd = ['ffmpeg'] + cmd_extra + cmd[1:]
+            cmd = ['ffmpeg'] + list(cmd_extra) + cmd[1:]
         res_local = run_cmd(cmd, capture_output=True)
         val = _parse_ssim(res_local.stderr or "")
         if val is None:
@@ -111,17 +114,17 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
     return val
 
 
-def measure_ssim(qp: int, samples: list, raw_fr: float, gop: int, audio_opts: list, metric: str) -> float:
+def measure_ssim(qp: int, samples: List[str], raw_fr: float, gop: int, audio_opts: List[str], metric: str) -> float:
     """
     Compute the chosen SSIM metric (avg/min/max) across all sample clips at a given QP.
     """
-    vals = []
+    vals: List[float] = []
     pbar = tqdm(samples, desc=f"SSIM@QP{qp}", leave=False)
     for s in pbar:
         vals.append(measure_ssim_on_sample(s, qp, raw_fr, gop, audio_opts))
     pbar.close()
 
-    results = {'avg': mean(vals), 'min': min(vals), 'max': max(vals)}
+    results: dict[str, float] = {'avg': mean(vals), 'min': min(vals), 'max': max(vals)}
     tqdm.write(
         f"Sample results at QP={qp}: SSIMs={vals} "
         f"avg={results['avg']:.4f} min={results['min']:.4f} max={results['max']:.4f}"
@@ -140,8 +143,8 @@ def measure_ssim(qp: int, samples: list, raw_fr: float, gop: int, audio_opts: li
     return results[metric]
 
 
-def find_best_qp(samples: list, min_qp: int, max_qp: int, target_ssim: float,
-                metric: str, audio_opts: list, raw_fr: float, gop: int) -> int:
+def find_best_qp(samples: List[str], min_qp: int, max_qp: int, target_ssim: float,
+                metric: str, audio_opts: List[str], raw_fr: float, gop: int) -> int:
     """
     Binary search for the lowest QP between min_qp and max_qp where sample-based SSIM >= target_ssim.
     """

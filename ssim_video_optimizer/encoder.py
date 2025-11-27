@@ -3,8 +3,10 @@
 import logging
 import os
 import subprocess
+import tempfile
+from typing import Dict, List, Sequence, Any, Tuple
 
-from .utils import run_cmd, run_ffmpeg_progress
+from .utils import run_ffmpeg_progress
 from .probes import (
     probe_video_duration,
     detect_hdr,
@@ -18,6 +20,52 @@ def measure_full_ssim(input_file: str, encoded_file: str) -> float | None:
     Returns None if parsing fails or SSIM is invalid.
     """
 
+    def _run_ffmpeg(extra: Sequence[str] | None = None) -> tuple[str, subprocess.CompletedProcess[str], str | None]:
+        """
+        Run ffmpeg, streaming output to a temp file (not memory) to avoid huge RAM use
+        on very long videos. Returns captured log text (from temp file) and the process.
+        """
+        log_file = tempfile.NamedTemporaryFile(prefix="ssim_ffmpeg_", suffix=".log", delete=False, mode="w+", encoding="utf-8")
+        log_path = log_file.name
+
+        # Limit threads and skip audio/sub decoding to reduce RAM/CPU; SIGKILLs likely mean OOM.
+        cmd: List[str] = [
+            'ffmpeg', '-nostdin', '-threads', '1', '-filter_threads', '1',
+            '-an', '-sn', '-v', 'warning'
+        ]
+        if extra:
+            cmd += extra
+        cmd += [
+            '-i', input_file, '-i', encoded_file,
+            '-filter_complex', 'ssim',
+            '-f', 'null', '-'
+        ]
+
+        res_local = subprocess.run(
+            cmd,
+            check=False,
+            stdout=log_file,
+            stderr=log_file,
+            text=True
+        )
+
+        log_file.flush()
+        log_file.seek(0)
+        log_text = log_file.read()
+        log_file.close()
+
+        # Only delete the temp log on success; keep it for diagnostics otherwise.
+        if res_local.returncode == 0:
+            try:
+                os.remove(log_path)
+            except OSError:
+                pass
+            log_path_ret: str | None = None
+        else:
+            log_path_ret = log_path
+
+        return log_text, res_local, log_path_ret
+
     def _parse_ssim(text: str) -> float | None:
         for line in text.splitlines():
             if 'All:' in line:
@@ -27,59 +75,53 @@ def measure_full_ssim(input_file: str, encoded_file: str) -> float | None:
                     return None
         return None
 
-    def _measure(extra=None):
-        cmd = ['ffmpeg', '-nostdin']
-        if extra:
-            cmd += extra
-        cmd += [
-            '-i', input_file, '-i', encoded_file,
-            '-filter_complex', 'ssim', '-f', 'null', '-'
-        ]
-        res_local = run_cmd(cmd, capture_output=True)
-        val = _parse_ssim(res_local.stderr or "")
-        if val is None:
-            val = _parse_ssim(res_local.stdout or "")
-        return val, res_local
+    def _measure(extra: Sequence[str] | None = None) -> Tuple[float | None, subprocess.CompletedProcess[str], str, str | None]:
+        log_text, res_local, log_path = _run_ffmpeg(extra=extra)
+        val_local = _parse_ssim(log_text)
+        return val_local, res_local, log_text, log_path
 
     val = None
-    res = None
-    res_fb = None
+    log_primary = ""
+    log_fb = ""
+    log_path_primary: str | None = None
+    log_path_fb: str | None = None
 
     try:
-        val, res = _measure()
+        val, _, log_primary, log_path_primary = _measure()
     except Exception as e:
-        logging.warning("Full-file SSIM command failed for %s (%s); retrying verbose.", encoded_file, e)
+        logging.warning(
+            "Full-file SSIM command failed for %s (%s); retrying verbose. Log: %s",
+            encoded_file, e, log_path_primary or "n/a"
+        )
 
     if val is None or val <= 0:
         try:
-            val_fb, res_fb = _measure(extra=['-v', 'info'])
+            val_fb, _, log_fb, log_path_fb = _measure(extra=['-v', 'info'])
             if val_fb is not None and val_fb > 0:
                 return val_fb
         except Exception as e:
-            logging.warning("Fallback full-file SSIM failed for %s (%s).", encoded_file, e)
+            logging.warning(
+                "Fallback full-file SSIM failed for %s (%s). Primary log: %s Fallback log: %s",
+                encoded_file, e, log_path_primary or "n/a", log_path_fb or "n/a"
+            )
 
     if val is not None and val > 0:
         return val
 
     # Persist logs to aid debugging
-    import tempfile
     log_file = tempfile.NamedTemporaryFile(prefix="full_ssim_", suffix=".log", delete=False, mode="w", encoding="utf-8")
-    if res and res.stderr:
-        log_file.write("PRIMARY STDERR:\n")
-        log_file.write(res.stderr)
+    if log_primary:
+        log_file.write("PRIMARY LOG:\n")
+        log_file.write(log_primary)
         log_file.write("\n")
-    if res and res.stdout:
-        log_file.write("PRIMARY STDOUT:\n")
-        log_file.write(res.stdout)
+    if log_fb:
+        log_file.write("FALLBACK LOG:\n")
+        log_file.write(log_fb)
         log_file.write("\n")
-    if res_fb and res_fb.stderr:
-        log_file.write("FALLBACK STDERR:\n")
-        log_file.write(res_fb.stderr)
-        log_file.write("\n")
-    if res_fb and res_fb.stdout:
-        log_file.write("FALLBACK STDOUT:\n")
-        log_file.write(res_fb.stdout)
-        log_file.write("\n")
+    if log_path_primary:
+        log_file.write(f"PRIMARY LOG PATH (kept): {log_path_primary}\n")
+    if log_path_fb:
+        log_file.write(f"FALLBACK LOG PATH (kept): {log_path_fb}\n")
     log_path = log_file.name
     log_file.close()
 
@@ -87,7 +129,7 @@ def measure_full_ssim(input_file: str, encoded_file: str) -> float | None:
     return None
 
 
-def build_hdr_sdr_filter(hdr: dict) -> str | None:
+def build_hdr_sdr_filter(hdr: Dict[str, Any]) -> str | None:
     """
     Builds HDR->SDR tonemapping filter chain for ffmpeg, if needed.
 
@@ -97,9 +139,7 @@ def build_hdr_sdr_filter(hdr: dict) -> str | None:
       - Fallback for other bt2020-tagged HDR-like streams
     """
 
-    prim = hdr["primaries"]
     tr = hdr["transfer"]
-    mat = hdr["matrix"]
 
     # PQ (HDR10)
     if tr == "smpte2084":
@@ -160,14 +200,16 @@ def encode_baseline(input_file: str, output_dir: str | None = None) -> str:
     """
 
     base, ext = os.path.splitext(os.path.basename(input_file))
-    filename = f"{base} [baseline qp 0]{ext}"
+    # Normalize container: keep mp4, otherwise use mkv to safely hold codecs.
+    out_ext = ".mp4" if ext.lower() == ".mp4" else ".mkv"
+    filename = f"{base} [baseline qp 0]{out_ext}"
     output = os.path.join(output_dir, filename) if output_dir else filename
 
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
 
     if low_res:
-        logging.info("Low-resolution source detected → baseline via libx264 (lossless-ish).")
+        logging.info("Low-resolution source detected → baseline via h264_nvenc (QP=0).")
     else:
         logging.info("High-resolution source → baseline via h264_nvenc (QP=0).")
 
@@ -204,77 +246,45 @@ def encode_baseline(input_file: str, output_dir: str | None = None) -> str:
         '-bf', '2',
     ]
 
-    x264_opts = [
-        '-c:v', 'libx264',
-        '-preset', 'veryslow',
-        '-qp', '0',
+    # GPU baseline (force NVENC even for low-res per user request)
+    cmd = base_cmd + nvenc_opts
+    cmd += [
+        '-c:a', 'copy',
+        '-c:s', 'copy',
+        output
     ]
 
-    if low_res:
-        # Completely avoid NVENC for SD content
-        cmd = base_cmd + x264_opts
-        cmd += [
-            '-c:a', 'copy',
-            '-c:s', 'copy',
-            output
-        ]
-        run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
-        return output
-    else:
-        # Original fast GPU baseline for HD/4K
-        cmd = base_cmd + nvenc_opts
-        cmd += [
-            '-c:a', 'copy',
-            '-c:s', 'copy',
-            output
-        ]
-
-        try:
-            run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
-        except subprocess.CalledProcessError as e:
-            log_path = getattr(e, "ffmpeg_log", None)
-            logging.warning(
-                "Baseline NVENC encode failed; retrying with libx264 (QP=0). "
-                "See FFmpeg log above for the failure reason."
-            )
-            if log_path:
-                print(f"NVENC baseline failed; FFmpeg log: {log_path}. Falling back to libx264.")
-            fallback_cmd = base_cmd + x264_opts
-            fallback_cmd += [
-                '-c:a', 'copy',
-                '-c:s', 'copy',
-                output
-            ]
-            run_ffmpeg_progress(fallback_cmd, total_duration, desc="Baseline Encode (libx264 fallback)")
+    run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
     return output
 
 
 def encode_final(
     input_file: str,
     qp: int,
-    audio_opts: list,
+    audio_opts: list[str],
     raw_fr: float,
     gop: int,
     return_ssim: bool = False,
     output_dir: str | None = None,
     output_base: str | None = None,
     output_ext: str | None = None,
-):
+) -> str | tuple[str, float | None]:
     """
     Final encode (from the baseline file), with FFmpeg progress and optional SSIM.
 
     - input_file here is the BASELINE file (already normalized to SDR, bt709).
-    - For low-res baselines, use libx264 -qp {qp}.
-    - For higher-res baselines, use h264_nvenc -qp {qp}.
+    - Uses h264_nvenc -qp {qp} for all baselines (low-res included).
     """
 
     base_in, ext_in = os.path.splitext(os.path.basename(input_file))
     base = output_base or base_in
-    ext = output_ext or ext_in
+    # Normalize container: keep mp4, otherwise mkv (even if caller passed e.g. .avi)
+    ext_hint = output_ext or ext_in
+    ext = ".mp4" if ext_hint.lower() == ".mp4" else ".mkv"
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
 
-    encoder_tag = "libx264" if low_res else "h264_nvenc"
+    encoder_tag = "h264_nvenc"
     filename = f"{base} [{encoder_tag} qp {qp}]{ext}"
     output = os.path.join(output_dir, filename) if output_dir else filename
 
@@ -290,28 +300,21 @@ def encode_final(
     ]
 
     if low_res:
-        logging.info("Low-resolution baseline → final encode via libx264 (QP=%d).", qp)
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', input_file,
-        ] + common_opts + [
-            '-c:v', 'libx264',
-            '-preset', 'slow',
-            '-qp', str(qp),
-        ] + audio_opts + ['-c:s', 'copy', output]
-        run_ffmpeg_progress(cmd, total_duration, desc=f"Final Encode (QP={qp})")
+        logging.info("Low-resolution baseline → final encode via h264_nvenc (QP=%d).", qp)
     else:
-        cmd = [
-            'ffmpeg', '-y',
-            '-hwaccel', 'cuda',
-            '-i', input_file,
-        ] + common_opts + [
-            '-c:v', 'h264_nvenc',
-            '-preset', 'p7',
-            '-rc', 'constqp',
-            '-qp', str(qp),
-        ] + audio_opts + ['-c:s', 'copy', output]
-        run_ffmpeg_progress(cmd, total_duration, desc=f"Final Encode (QP={qp})")
+        logging.info("High-resolution baseline → final encode via h264_nvenc (QP=%d).", qp)
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-hwaccel', 'cuda',
+        '-i', input_file,
+    ] + common_opts + [
+        '-c:v', 'h264_nvenc',
+        '-preset', 'p7',
+        '-rc', 'constqp',
+        '-qp', str(qp),
+    ] + audio_opts + ['-c:s', 'copy', output]
+    run_ffmpeg_progress(cmd, total_duration, desc=f"Final File Encode (QP={qp})")
 
     if return_ssim:
         ssim_val = measure_full_ssim(input_file, output)

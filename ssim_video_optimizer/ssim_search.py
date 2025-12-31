@@ -53,7 +53,22 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
         if cmd_extra:
             # Insert extra options after ffmpeg
             cmd = ['ffmpeg'] + list(cmd_extra) + cmd[1:]
-        res_local = run_cmd(cmd, capture_output=True)
+        
+        # Use Popen with communicate() to avoid pipe deadlock on large output
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate(timeout=300)  # 5-minute timeout per sample
+            res_local = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            logging.warning("SSIM measurement timed out for %s at QP=%d", sample_file, qp)
+            return None, subprocess.CompletedProcess(cmd, 1, "", "Timeout")
+        
         val = _parse_ssim(res_local.stderr or "")
         if val is None:
             val = _parse_ssim(res_local.stdout or "")

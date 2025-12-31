@@ -32,6 +32,9 @@ def _detect_scene_times(input_file: str, threshold: float) -> list[float]:
     res = run_cmd(
         [
             'ffmpeg', '-v', 'info', '-i', input_file,
+            # Only analyze video; some files have broken audio streams that
+            # cause ffmpeg to bail out before running the filter graph.
+            '-map', '0:v:0', '-an',
             '-vf', filter_expr,
             '-f', 'null', '-'
         ],

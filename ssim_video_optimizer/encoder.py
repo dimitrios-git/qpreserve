@@ -31,7 +31,7 @@ def measure_full_ssim(input_file: str, encoded_file: str) -> float | None:
         # Limit threads and skip audio/sub decoding to reduce RAM/CPU; SIGKILLs likely mean OOM.
         cmd: List[str] = [
             'ffmpeg', '-nostdin', '-threads', '1', '-filter_threads', '1',
-            '-an', '-sn', '-v', 'warning'
+            '-an', '-sn', '-v', 'info'
         ]
         if extra:
             cmd += extra

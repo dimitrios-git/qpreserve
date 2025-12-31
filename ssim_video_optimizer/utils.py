@@ -12,7 +12,7 @@ from tqdm import tqdm
 # BASIC SIMPLE COMMAND RUNNER
 # ────────────────────────────────────────────────
 
-def run_cmd(cmd: Sequence[Any], capture_output: bool = False) -> subprocess.CompletedProcess[str]:
+def run_cmd(cmd: Sequence[Any], capture_output: bool = False, timeout: Optional[int] = None) -> subprocess.CompletedProcess[str]:
     """
     Basic command runner used for ffprobe calls, SSIM evaluation,
     sample encoding, etc., where progress is NOT needed.
@@ -23,7 +23,8 @@ def run_cmd(cmd: Sequence[Any], capture_output: bool = False) -> subprocess.Comp
         check=True,
         stdout=(subprocess.PIPE if capture_output else subprocess.DEVNULL),
         stderr=(subprocess.PIPE if capture_output else subprocess.DEVNULL),
-        text=True
+        text=True,
+        timeout=timeout
     )
 
 

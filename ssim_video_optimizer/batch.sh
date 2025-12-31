@@ -8,7 +8,8 @@
 set -uo pipefail
 
 ROOT="${1:-.}"
-video_exts="mp4 mkv mov m4v avi ts mpg mpeg"
+video_exts="mp4 mkv mov m4v avi ts mpg mpeg wmv"
+found_any=0
 
 find_converted() {
     local dir="$1" name="$2" ext="$3"
@@ -64,7 +65,8 @@ for f in "${FILES[@]}"; do
     fi
 
     # MIME check
-    if ! file --mime-type "$f" | grep -q 'video/'; then
+    mime=$(file --mime-type -b "$f")
+    if [[ "$mime" != video/* && "$mime" != "application/octet-stream" ]]; then
         continue
     fi
 
@@ -91,6 +93,7 @@ for f in "${FILES[@]}"; do
     fi
 
     echo "PROCESS: $f"
+    found_any=1
     if ! ssim-video-optimizer "$f"; then
         echo "FAIL (optimizer exited non-zero): $f"
         continue
@@ -104,3 +107,7 @@ for f in "${FILES[@]}"; do
         echo "WARN: could not locate produced file for $f"
     fi
 done
+
+if [[ $found_any -eq 0 ]]; then
+    echo "No supported video files found under: $ROOT"
+fi

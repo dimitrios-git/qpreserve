@@ -5,7 +5,7 @@
 - CLI tool to re-encode videos with NVIDIA NVENC H.264 while hitting a target perceptual quality threshold using SSIM.  
 - Automates sample selection, QP search, and final encode with progress feedback, handling HDR→SDR tonemapping when needed.
 
-## End-to-End Flow (`ssim_video_optimizer/cli.py`)
+## End-to-End Flow (`qpreserve/cli.py`)
 
 - Validate input exists, probe basic video info, and warn/confirm on problematic sources (resolutions >4096 or 10-bit pixel formats).  
 - Set up logging and scratch directories (env `SSIM_SCRATCH_DIR` or `--scratch-dir`), warning if free space looks low.  
@@ -35,9 +35,9 @@
 
 ## Entry Points
 
-- Python: `python -m ssim_video_optimizer` or `ssim_video_optimizer.cli:main`.  
+- Python: `python -m qpreserve` or `qpreserve.cli:main`.  
 - CLI script: `qpreserve` (installed via packaging).  
-- Batch helper: `ssim_video_optimizer/batch.sh` for directory-wide processing.
+- Batch helper: `qpreserve/batch.sh` for directory-wide processing.
 
 ## Next Features and Plans (ideas)
 

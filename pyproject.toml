@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-qpreserve = "ssim_video_optimizer.cli:main"
+qpreserve = "qpreserve.cli:main"
 
 [tool.setuptools]
-packages = ["ssim_video_optimizer"]
+packages = ["qpreserve"]

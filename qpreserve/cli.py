@@ -130,12 +130,13 @@ def _determine_baseline_file(
     skip_baseline: bool,
     pix_fmt: str,
     baseline_tmp: str,
+    baseline_qp: int,
 ) -> str:
     if skip_baseline and _validate_skip_baseline(input_path, pix_fmt):
         print("Skipping baseline generation; using source file directly.")
         return input_path
 
-    baseline_file = encode_baseline(input_path, output_dir=baseline_tmp)
+    baseline_file = encode_baseline(input_path, output_dir=baseline_tmp, qp=baseline_qp)
     print(f"Baseline file created: {baseline_file}")
     return baseline_file
 
@@ -163,7 +164,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='Percentage of video duration used for sampling.')
     parser.add_argument('--sample-count', type=int, default=3,
                         help='How many sample clips to extract.')
-    parser.add_argument('--sample-qp', type=int, default=0,
+    parser.add_argument('--sample-qp', type=int, default=15,
                         help='QP used to encode sample clips.')
     parser.add_argument(
         '--initial-qp',
@@ -217,6 +218,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Skip baseline generation and use source directly. Only recommended for sources '
              'that are already SDR, yuv420p, and BT.709. Ignored for HDR sources.'
+    )
+
+    parser.add_argument(
+        '--baseline-qp',
+        type=int,
+        default=15,
+        help='QP used to generate the baseline file.'
     )
 
     return parser
@@ -474,7 +482,7 @@ def main():
 
     try:
         # ------------------------------------------------------------
-        # STEP 1 — BASELINE (QP=0) ENCODE with PROGRESS (+ optional HDR->SDR)
+        # STEP 1 — BASELINE (QP=baseline) ENCODE with PROGRESS (+ optional HDR->SDR)
         # ------------------------------------------------------------
         # Check if we should skip baseline (only if source meets requirements)
         baseline_file = _determine_baseline_file(
@@ -482,6 +490,7 @@ def main():
             skip_baseline=args.skip_baseline,
             pix_fmt=pix_fmt,
             baseline_tmp=baseline_tmp,
+            baseline_qp=args.baseline_qp,
         )
 
         # ------------------------------------------------------------

@@ -372,34 +372,34 @@ def _get_resolution_label(path: str) -> str:
         return f"{min_dim}p"  # Fallback for unusual resolutions
 
 
-def encode_baseline(input_file: str, output_dir: str | None = None) -> str:
+def encode_baseline(input_file: str, output_dir: str | None = None, qp: int = 15) -> str:
     """
     Step 0 + 1: Create the "baseline" file from the ORIGINAL source.
 
     - Detect HDR and apply HDR->SDR tonemapping if needed.
     - Normalize to SDR BT.709, yuv420p, SAR=1.
     - Attempt H.264 NVENC in constqp mode:
-        - QP=0
+        - QP=baseline
         - preset=p7
         - bf=2
     - If NVENC fails, fall back to libx264 lossless-ish baseline:
-        - QP=0
+        - QP=baseline
         - preset=veryslow
     """
 
     base, ext = os.path.splitext(os.path.basename(input_file))
     # Normalize container: keep mp4, otherwise use mkv to safely hold codecs.
     out_ext = ".mp4" if ext.lower() == ".mp4" else ".mkv"
-    filename = f"{base} [baseline qp 0]{out_ext}"
+    filename = f"{base} [baseline qp {qp}]{out_ext}"
     output = os.path.join(output_dir, filename) if output_dir else filename
 
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
 
     if low_res:
-        logging.info("Low-resolution source detected → baseline via h264_nvenc (QP=0).")
+        logging.info("Low-resolution source detected → baseline via h264_nvenc (QP=%d).", qp)
     else:
-        logging.info("High-resolution source → baseline via h264_nvenc (QP=0).")
+        logging.info("High-resolution source → baseline via h264_nvenc (QP=%d).", qp)
 
     # HDR detection + tonemap
     hdr_info = detect_hdr(input_file)
@@ -430,7 +430,7 @@ def encode_baseline(input_file: str, output_dir: str | None = None) -> str:
         '-c:v', 'h264_nvenc',
         '-preset', 'p7',
         '-rc', 'constqp',
-        '-qp', '0',
+        '-qp', str(qp),
         '-bf', '2',
     ]
 
@@ -445,11 +445,11 @@ def encode_baseline(input_file: str, output_dir: str | None = None) -> str:
     try:
         run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
     except subprocess.CalledProcessError as err:
-        logging.warning("NVENC baseline failed (%s). Falling back to libx264 QP=0.", err)
+        logging.warning("NVENC baseline failed (%s). Falling back to libx264 baseline QP.", err)
         cpu_cmd = base_cmd + [
             '-c:v', 'libx264',
             '-preset', 'veryslow',
-            '-qp', '0',
+            '-qp', str(qp),
             '-c:a', 'copy',
             '-c:s', 'copy',
             output

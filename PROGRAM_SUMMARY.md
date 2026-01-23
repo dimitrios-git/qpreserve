@@ -23,7 +23,6 @@
 - `ssim_search.py`: Sample re-encode + SSIM measurement (lightweight ffmpeg runs) and binary search to pick QP.  
 - `probes.py`: FFprobe wrappers for duration, framerate, HDR metadata, stream info.  
 - `utils.py`: Command runner, FFmpeg progress integration (uses `-progress` + tqdm), audio option builder (copy AAC else encode AAC @64 kbps/channel), filter availability helper.  
-- `batch.sh`: Finds video files recursively, skips already converted/tagged outputs, and runs `qpreserve` per file; removes tiny outputs and continues on errors.
 
 ## Assumptions and Notable Behaviors
 
@@ -37,7 +36,6 @@
 
 - Python: `python -m qpreserve` or `qpreserve.cli:main`.  
 - CLI script: `qpreserve` (installed via packaging).  
-- Batch helper: `qpreserve/batch.sh` for directory-wide processing.
 
 ## Next Features and Plans (ideas)
 

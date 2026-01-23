@@ -142,7 +142,8 @@ def _determine_baseline_file(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Optimize video quality via perceptual metric and QP binary search.'
+        description='Optimize video quality via perceptual metric and QP binary search.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument('input', help='Source video file')

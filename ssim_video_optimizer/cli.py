@@ -140,81 +140,7 @@ def _determine_baseline_file(
     return baseline_file
 
 
-def _encode_with_full_ssim(
-    baseline_file: str,
-    best_qp: int,
-    min_qp: int,
-    target_ssim: float,
-    audio_opts: List[str],
-    raw_fr: float,
-    gop: int,
-    ssim_chunk_seconds: float | None,
-    tmpdir: str,
-    source_base: str,
-    source_ext: str,
-) -> tuple[str, int]:
-    prev_file: str | None = None
-    final_file: str | None = None
-    for qp in range(best_qp, min_qp - 1, -1):
-        print(f"\nChecking full-file quality at QP={qp}...")
-
-        # Clean up older intermediate file
-        if prev_file and os.path.exists(prev_file):
-            os.remove(prev_file)
-
-        # Encode full file (this has its own real FFmpeg progress bar)
-        output_path, ssim_val = cast(
-            tuple[str, float | None],
-            encode_final(
-                input_file=baseline_file,
-                qp=qp,
-                audio_opts=audio_opts,
-                raw_fr=raw_fr,
-                gop=gop,
-                return_ssim=True,
-                ssim_chunk_seconds=ssim_chunk_seconds,
-                output_dir=tmpdir,
-                output_base=source_base,
-                output_ext=source_ext,
-            ),
-        )
-        # output_path is str, ssim_val is Optional[float]
-        output_path_str: str = output_path
-        ssim_val_opt: float | None = ssim_val
-        if ssim_val_opt is None:
-            logging.warning("Full-file SSIM unavailable at QP=%d; keeping this encode.", qp)
-            return output_path_str, qp
-
-        print(f"  → SSIM={ssim_val_opt:.4f}")
-
-        # Round to 4 decimals before comparison to match displayed value
-        ssim_rounded = round(ssim_val_opt, 4)
-        if ssim_rounded >= target_ssim:
-            print(f"  ✓ Meets target SSIM ≥ {target_ssim}; accepting QP={qp}")
-            return output_path_str, qp
-
-        print("  ✗ Below target; trying lower QP...")
-        prev_file = output_path_str
-
-    logging.warning("Could not meet SSIM target; using sample-based QP=%d", best_qp)
-    final_file = prev_file or cast(
-        str,
-        encode_final(
-            input_file=baseline_file,
-            qp=best_qp,
-            audio_opts=audio_opts,
-            raw_fr=raw_fr,
-            gop=gop,
-            return_ssim=False,
-            output_dir=tmpdir,
-            output_base=source_base,
-            output_ext=source_ext,
-        ),
-    )
-    return final_file, best_qp
-
-
-def main():
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Optimize video quality via perceptual metric and QP binary search.'
     )
@@ -292,6 +218,213 @@ def main():
              'that are already SDR, yuv420p, and BT.709. Ignored for HDR sources.'
     )
 
+    return parser
+
+
+def _probe_video_basics(input_path: str) -> tuple[int, int, str]:
+    vinfo: Dict[str, Any] = probe_video_stream_info(input_path)
+    width: int = int(vinfo['width'])
+    height: int = int(vinfo['height'])
+    pix_fmt: str = str(vinfo['pix_fmt'])
+    return width, height, pix_fmt
+
+
+def _prepare_audio_and_framerate(
+    input_path: str, audio_normalize: bool
+) -> tuple[List[str], float, bool]:
+    streams: List[Dict[str, Any]] = probe_audio_streams(input_path)
+    normalize_enabled = audio_normalize
+    if normalize_enabled and not has_filter('loudnorm'):
+        print("WARNING: loudnorm filter not available; disabling audio normalization.")
+        normalize_enabled = False
+    audio_opts: List[str] = build_audio_options(streams, normalize=normalize_enabled)
+    raw_fr: float = probe_video_framerate(input_path)
+    return audio_opts, raw_fr, normalize_enabled
+
+
+def _calculate_gop(raw_fr: float) -> int:
+    return max(1, int(round(raw_fr / 2)))
+
+
+def _select_best_qp(
+    args: argparse.Namespace,
+    baseline_file: str,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    scratch_root: str,
+) -> tuple[int, str | None]:
+    if args.initial_qp is not None:
+        if args.initial_qp < args.min_qp:
+            print(
+                f"WARNING: --initial-qp {args.initial_qp} is below --min-qp {args.min_qp}; "
+                "lowering min-qp to match."
+            )
+            args.min_qp = args.initial_qp
+        if args.initial_qp > args.max_qp:
+            print(
+                f"WARNING: --initial-qp {args.initial_qp} is above --max-qp {args.max_qp}; "
+                "sampling bounds will be ignored."
+            )
+        best_qp = args.initial_qp
+        print(f"Skipping sampling; starting full-file SSIM descent at QP={best_qp}.")
+        return best_qp, None
+
+    samples, samples_tmpdir = extract_samples(
+        baseline_file,
+        percent=args.sample_percent,
+        count=args.sample_count,
+        sample_qp=args.sample_qp,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        sampling_mode=args.sampling_mode,
+        tmp_root=scratch_root,
+    )
+    if not samples_tmpdir:
+        samples_tmpdir = None
+
+    # NOTE: metric_effective is always 'ssim' for now.
+    try:
+        is_source_ref = os.path.samefile(baseline_file, args.input)
+    except OSError:
+        is_source_ref = baseline_file == args.input
+    ref_label = "source" if is_source_ref else "baseline"
+    print(f"Starting sample SSIM checks against {ref_label}...")
+    best_qp = find_best_qp(
+        samples=samples,
+        min_qp=args.min_qp,
+        max_qp=args.max_qp,
+        target_ssim=args.ssim,
+        metric=args.metric,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop
+    )
+    return best_qp, samples_tmpdir
+
+
+def _run_final_encode(
+    args: argparse.Namespace,
+    baseline_file: str,
+    best_qp: int,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    tmpdir: str,
+) -> tuple[str, int]:
+    source_base, source_ext = os.path.splitext(os.path.basename(args.input))
+
+    if args.skip_full_ssim:
+        if args.initial_qp is not None:
+            print("WARNING: --skip-full-ssim overrides full-file verification.")
+        print("\nSkipping full-file SSIM verification; encoding once at selected QP.")
+        final_file = cast(
+            str,
+            encode_final(
+                input_file=baseline_file,
+                qp=best_qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                return_ssim=False,
+                output_dir=tmpdir,
+                output_base=source_base,
+                output_ext=source_ext,
+            ),
+        )
+        return final_file, best_qp
+
+    return _encode_with_full_ssim(
+        baseline_file=baseline_file,
+        best_qp=best_qp,
+        min_qp=args.min_qp,
+        target_ssim=args.ssim,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        ssim_chunk_seconds=args.full_ssim_chunk_seconds,
+        tmpdir=tmpdir,
+        source_base=source_base,
+        source_ext=source_ext,
+    )
+
+
+def _encode_with_full_ssim(
+    baseline_file: str,
+    best_qp: int,
+    min_qp: int,
+    target_ssim: float,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    ssim_chunk_seconds: float | None,
+    tmpdir: str,
+    source_base: str,
+    source_ext: str,
+) -> tuple[str, int]:
+    prev_file: str | None = None
+    final_file: str | None = None
+    for qp in range(best_qp, min_qp - 1, -1):
+        print(f"\nChecking full-file quality at QP={qp}...")
+
+        # Clean up older intermediate file
+        if prev_file and os.path.exists(prev_file):
+            os.remove(prev_file)
+
+        # Encode full file (this has its own real FFmpeg progress bar)
+        output_path, ssim_val = cast(
+            tuple[str, float | None],
+            encode_final(
+                input_file=baseline_file,
+                qp=qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                return_ssim=True,
+                ssim_chunk_seconds=ssim_chunk_seconds,
+                output_dir=tmpdir,
+                output_base=source_base,
+                output_ext=source_ext,
+            ),
+        )
+        # output_path is str, ssim_val is Optional[float]
+        output_path_str: str = output_path
+        ssim_val_opt: float | None = ssim_val
+        if ssim_val_opt is None:
+            logging.warning("Full-file SSIM unavailable at QP=%d; keeping this encode.", qp)
+            return output_path_str, qp
+
+        print(f"  → SSIM={ssim_val_opt:.4f}")
+
+        # Round to 4 decimals before comparison to match displayed value
+        ssim_rounded = round(ssim_val_opt, 4)
+        if ssim_rounded >= target_ssim:
+            print(f"  ✓ Meets target SSIM ≥ {target_ssim}; accepting QP={qp}")
+            return output_path_str, qp
+
+        print("  ✗ Below target; trying lower QP...")
+        prev_file = output_path_str
+
+    logging.warning("Could not meet SSIM target; using sample-based QP=%d", best_qp)
+    final_file = prev_file or cast(
+        str,
+        encode_final(
+            input_file=baseline_file,
+            qp=best_qp,
+            audio_opts=audio_opts,
+            raw_fr=raw_fr,
+            gop=gop,
+            return_ssim=False,
+            output_dir=tmpdir,
+            output_base=source_base,
+            output_ext=source_ext,
+        ),
+    )
+    return final_file, best_qp
+
+
+def main():
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
     # ------------------------------------------------------------
@@ -306,10 +439,7 @@ def main():
     # ------------------------------------------------------------
     # Probe basic video info (for impossible-encode checks)
     # ------------------------------------------------------------
-    vinfo: Dict[str, Any] = probe_video_stream_info(args.input)
-    width: int = int(vinfo['width'])
-    height: int = int(vinfo['height'])
-    pix_fmt: str = str(vinfo['pix_fmt'])
+    width, height, pix_fmt = _probe_video_basics(args.input)
 
     if not _confirm_h264_compat(width, height, pix_fmt):
         return
@@ -326,12 +456,9 @@ def main():
     # ------------------------------------------------------------
     # Probe audio/video from original file
     # ------------------------------------------------------------
-    streams: List[Dict[str, Any]] = probe_audio_streams(args.input)
-    if args.audio_normalize and not has_filter('loudnorm'):
-        print("WARNING: loudnorm filter not available; disabling audio normalization.")
-        args.audio_normalize = False
-    audio_opts: List[str] = build_audio_options(streams, normalize=args.audio_normalize)
-    raw_fr: float = probe_video_framerate(args.input)
+    audio_opts, raw_fr, args.audio_normalize = _prepare_audio_and_framerate(
+        args.input, args.audio_normalize
+    )
 
     # ------------------------------------------------------------
     # Prepare temp directories
@@ -358,99 +485,33 @@ def main():
 
         # ------------------------------------------------------------
         # GOP ~ half framerate
-        gop = max(1, int(round(raw_fr / 2)))
+        gop = _calculate_gop(raw_fr)
 
         # ------------------------------------------------------------
         # STEP 2 — SAMPLE CLIP EXTRACTION (optional)
         # ------------------------------------------------------------
-        if args.initial_qp is not None:
-            if args.initial_qp < args.min_qp:
-                print(
-                    f"WARNING: --initial-qp {args.initial_qp} is below --min-qp {args.min_qp}; "
-                    "lowering min-qp to match."
-                )
-                args.min_qp = args.initial_qp
-            if args.initial_qp > args.max_qp:
-                print(
-                    f"WARNING: --initial-qp {args.initial_qp} is above --max-qp {args.max_qp}; "
-                    "sampling bounds will be ignored."
-                )
-            best_qp = args.initial_qp
-            print(f"Skipping sampling; starting full-file SSIM descent at QP={best_qp}.")
-        else:
-            samples, samples_tmpdir = extract_samples(
-                baseline_file,
-                percent=args.sample_percent,
-                count=args.sample_count,
-                sample_qp=args.sample_qp,
-                audio_opts=audio_opts,
-                raw_fr=raw_fr,
-                sampling_mode=args.sampling_mode,
-                tmp_root=scratch_root,
-            )
-            if not samples_tmpdir:
-                samples_tmpdir = None
-
-            # ------------------------------------------------------------
-            # STEP 3 — SAMPLE-BASED QP SEARCH (currently SSIM-only)
-            # ------------------------------------------------------------
-            # NOTE: metric_effective is always 'ssim' for now.
-            try:
-                is_source_ref = os.path.samefile(baseline_file, args.input)
-            except OSError:
-                is_source_ref = baseline_file == args.input
-            ref_label = "source" if is_source_ref else "baseline"
-            print(f"Starting sample SSIM checks against {ref_label}...")
-            best_qp = find_best_qp(
-                samples=samples,
-                min_qp=args.min_qp,
-                max_qp=args.max_qp,
-                target_ssim=args.ssim,
-                metric=args.metric,
-                audio_opts=audio_opts,
-                raw_fr=raw_fr,
-                gop=gop
-            )
+        best_qp, samples_tmpdir = _select_best_qp(
+            args=args,
+            baseline_file=baseline_file,
+            audio_opts=audio_opts,
+            raw_fr=raw_fr,
+            gop=gop,
+            scratch_root=scratch_root,
+        )
 
         # ------------------------------------------------------------
         # STEP 4 — FULL-FILE FINAL ENCODE DESCENT (CLEANER OUTPUT)
         # ------------------------------------------------------------
 
-        source_base, source_ext = os.path.splitext(os.path.basename(args.input))
-
-        if args.skip_full_ssim:
-            if args.initial_qp is not None:
-                print("WARNING: --skip-full-ssim overrides full-file verification.")
-            print("\nSkipping full-file SSIM verification; encoding once at selected QP.")
-            final_file = cast(
-                str,
-                encode_final(
-                    input_file=baseline_file,
-                    qp=best_qp,
-                    audio_opts=audio_opts,
-                    raw_fr=raw_fr,
-                    gop=gop,
-                    return_ssim=False,
-                    output_dir=tmpdir,
-                    output_base=source_base,
-                    output_ext=source_ext,
-                ),
-            )
-            final_qp = best_qp
-        else:
-            final_file, final_qp = _encode_with_full_ssim(
-                baseline_file=baseline_file,
-                best_qp=best_qp,
-                min_qp=args.min_qp,
-                target_ssim=args.ssim,
-                audio_opts=audio_opts,
-                raw_fr=raw_fr,
-                gop=gop,
-                ssim_chunk_seconds=args.full_ssim_chunk_seconds,
-                tmpdir=tmpdir,
-                source_base=source_base,
-                source_ext=source_ext,
-            )
+        final_file, final_qp = _run_final_encode(
+            args=args,
+            baseline_file=baseline_file,
+            best_qp=best_qp,
+            audio_opts=audio_opts,
+            raw_fr=raw_fr,
+            gop=gop,
+            tmpdir=tmpdir,
+        )
 
         # ------------------------------------------------------------
         # STEP 5 — MOVE FINAL RESULT TO SOURCE DIRECTORY

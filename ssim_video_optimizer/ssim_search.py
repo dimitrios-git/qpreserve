@@ -14,9 +14,36 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
     """
     Re-encode a sample at the given QP (with the proper GOP) and measure SSIM against the original.
     """
-    ext = os.path.splitext(sample_file)[1]
-    temp_out = sample_file.replace(ext, f'_enc{ext}')
+    temp_out = _sample_encoded_path(sample_file)
+    if not _encode_sample(sample_file, temp_out, qp, raw_fr, gop, audio_opts):
+        return 0.0
 
+    tqdm.write(f"  Measuring SSIM for sample {os.path.basename(sample_file)} at QP={qp}...")
+    val, res = _measure_ssim(sample_file, temp_out, qp)
+    if val is not None and val > 0:
+        return val
+
+    val_fb, res_fb = _measure_ssim(sample_file, temp_out, qp, cmd_extra=['-v', 'info'])
+    if val_fb is not None and val_fb > 0:
+        return val_fb
+
+    _persist_ssim_logs(sample_file, qp, res, res_fb)
+    return 0.0
+
+
+def _sample_encoded_path(sample_file: str) -> str:
+    ext = os.path.splitext(sample_file)[1]
+    return sample_file.replace(ext, f'_enc{ext}')
+
+
+def _encode_sample(
+    sample_file: str,
+    temp_out: str,
+    qp: int,
+    raw_fr: float,
+    gop: int,
+    audio_opts: List[str],
+) -> bool:
     try:
         run_cmd([
             'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', sample_file,
@@ -29,107 +56,107 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
             "Sample encode failed for %s at QP=%d (%s); using SSIM=0.",
             sample_file, qp, e
         )
-        return 0.0
+        return False
+    return True
 
-    # Measure SSIM
-    tqdm.write(f"  Measuring SSIM for sample {os.path.basename(sample_file)} at QP={qp}...")
-    def _parse_ssim(text: str) -> float | None:
-        for line in text.splitlines():
-            if 'All:' in line:
-                try:
-                    return float(line.split('All:')[1].split()[0])
-                except (ValueError, IndexError):
-                    return None
-        return None
 
-    def _measure(cmd_extra: Sequence[str] | None = None) -> Tuple[float | None, subprocess.CompletedProcess[str]]:
-        # Keep SSIM probe lightweight to reduce OOM risk.
-        cmd: List[str] = [
-            'ffmpeg', '-nostdin', '-threads', '1', '-an', '-sn',
-            '-i', sample_file,
-            '-i', temp_out,
-            '-filter_complex', 'ssim',
-            '-f', 'null', '-'
-        ]
-        if cmd_extra:
-            # Insert extra options after ffmpeg
-            cmd = ['ffmpeg'] + list(cmd_extra) + cmd[1:]
-        
-        # Use Popen with communicate() to avoid pipe deadlock on large output
-        process: subprocess.Popen[str] | None = None
-        try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            stdout, stderr = process.communicate(timeout=300)  # 5-minute timeout per sample
-            res_local = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
-        except subprocess.TimeoutExpired:
-            if process is not None:
-                process.kill()
-            logging.warning("SSIM measurement timed out for %s at QP=%d", sample_file, qp)
-            return None, subprocess.CompletedProcess(cmd, 1, "", "Timeout")
-        
-        val = _parse_ssim(res_local.stderr or "")
-        if val is None:
-            val = _parse_ssim(res_local.stdout or "")
-        return val, res_local
+def _parse_ssim(text: str) -> float | None:
+    for line in text.splitlines():
+        if 'All:' in line:
+            try:
+                return float(line.split('All:')[1].split()[0])
+            except (ValueError, IndexError):
+                return None
+    return None
 
+
+def _measure_ssim(
+    sample_file: str,
+    temp_out: str,
+    qp: int,
+    cmd_extra: Sequence[str] | None = None,
+) -> Tuple[float | None, subprocess.CompletedProcess[str] | None]:
+    # Keep SSIM probe lightweight to reduce OOM risk.
+    cmd: List[str] = [
+        'ffmpeg', '-nostdin', '-threads', '1', '-an', '-sn',
+        '-i', sample_file,
+        '-i', temp_out,
+        '-filter_complex', 'ssim',
+        '-f', 'null', '-'
+    ]
+    if cmd_extra:
+        # Insert extra options after ffmpeg
+        cmd = ['ffmpeg'] + list(cmd_extra) + cmd[1:]
+
+    # Use Popen with communicate() to avoid pipe deadlock on large output
+    process: subprocess.Popen[str] | None = None
     try:
-        val, res = _measure()
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = process.communicate(timeout=300)  # 5-minute timeout per sample
+        res_local = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        if process is not None:
+            process.kill()
+        logging.warning("SSIM measurement timed out for %s at QP=%d", sample_file, qp)
+        return None, subprocess.CompletedProcess(cmd, 1, "", "Timeout")
     except Exception as e:
         logging.warning(
-            "SSIM measurement failed for %s at QP=%d (%s); retrying with verbose log.",
-            sample_file, qp, e
+            "SSIM measurement failed for %s at QP=%d (%s)%s",
+            sample_file,
+            qp,
+            e,
+            "; retrying with verbose log." if cmd_extra is None else "; using SSIM=0."
         )
-        val = None
-        res = None
+        return None, None
 
-    if val is None or val <= 0:
-        try:
-            val_fb, res_fb = _measure(cmd_extra=['-v', 'info'])
-        except Exception as e:
-            logging.warning(
-                "Fallback SSIM measurement failed for %s at QP=%d (%s); using SSIM=0.",
-                sample_file, qp, e
-            )
-            val_fb = None
-            res_fb = None
+    val = _parse_ssim(res_local.stderr or "")
+    if val is None:
+        val = _parse_ssim(res_local.stdout or "")
+    return val, res_local
 
-        if val_fb is not None and val_fb > 0:
-            return val_fb
 
-        # Persist logs to help diagnose recurring parse failures
-        import tempfile
-        log_file = tempfile.NamedTemporaryFile(prefix="ssim_measure_", suffix=".log", delete=False, mode="w", encoding="utf-8")
-        if res and res.stderr:
-            log_file.write("PRIMARY STDERR:\n")
-            log_file.write(res.stderr)
-            log_file.write("\n")
-        if res and res.stdout:
-            log_file.write("PRIMARY STDOUT:\n")
-            log_file.write(res.stdout)
-            log_file.write("\n")
-        if res_fb and res_fb.stderr:
-            log_file.write("FALLBACK STDERR:\n")
-            log_file.write(res_fb.stderr)
-            log_file.write("\n")
-        if res_fb and res_fb.stdout:
-            log_file.write("FALLBACK STDOUT:\n")
-            log_file.write(res_fb.stdout)
-            log_file.write("\n")
-        log_path = log_file.name
-        log_file.close()
+def _persist_ssim_logs(
+    sample_file: str,
+    qp: int,
+    res: subprocess.CompletedProcess[str] | None,
+    res_fb: subprocess.CompletedProcess[str] | None,
+) -> None:
+    import tempfile
+    log_file = tempfile.NamedTemporaryFile(
+        prefix="ssim_measure_",
+        suffix=".log",
+        delete=False,
+        mode="w",
+        encoding="utf-8"
+    )
+    if res and res.stderr:
+        log_file.write("PRIMARY STDERR:\n")
+        log_file.write(res.stderr)
+        log_file.write("\n")
+    if res and res.stdout:
+        log_file.write("PRIMARY STDOUT:\n")
+        log_file.write(res.stdout)
+        log_file.write("\n")
+    if res_fb and res_fb.stderr:
+        log_file.write("FALLBACK STDERR:\n")
+        log_file.write(res_fb.stderr)
+        log_file.write("\n")
+    if res_fb and res_fb.stdout:
+        log_file.write("FALLBACK STDOUT:\n")
+        log_file.write(res_fb.stdout)
+        log_file.write("\n")
+    log_path = log_file.name
+    log_file.close()
 
-        logging.warning(
-            "Could not parse SSIM for sample %s at QP=%d; using SSIM=0. See log: %s",
-            sample_file, qp, log_path
-        )
-        return 0.0
-
-    return val
+    logging.warning(
+        "Could not parse SSIM for sample %s at QP=%d; using SSIM=0. See log: %s",
+        sample_file, qp, log_path
+    )
 
 
 def measure_ssim(qp: int, samples: List[str], raw_fr: float, gop: int, audio_opts: List[str], metric: str) -> float:

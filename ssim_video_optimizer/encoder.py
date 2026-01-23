@@ -14,6 +14,255 @@ from .probes import (
 )
 
 
+def _build_ssim_filter_chain(raw_fr: float | None) -> str:
+    # Normalize timestamps (and optionally FPS) to avoid large frame sync buffers
+    # that can blow up RAM on long or VFR sources.
+    if raw_fr and raw_fr > 0:
+        fr_str = f"{raw_fr:.6f}".rstrip("0").rstrip(".")
+        return (
+            f"[0:v]fps={fr_str},setpts=PTS-STARTPTS[ref];"
+            f"[1:v]fps={fr_str},setpts=PTS-STARTPTS[dist];"
+            "[ref][dist]ssim"
+        )
+    return (
+        "[0:v]setpts=PTS-STARTPTS[ref];"
+        "[1:v]setpts=PTS-STARTPTS[dist];"
+        "[ref][dist]ssim"
+    )
+
+
+def _run_ssim_ffmpeg(
+    input_file: str,
+    encoded_file: str,
+    filter_chain: str,
+    extra: Sequence[str] | None = None,
+    start: float | None = None,
+    duration: float | None = None,
+) -> tuple[str, subprocess.CompletedProcess[str], str | None]:
+    """
+    Run ffmpeg, streaming output to a temp file (not memory) to avoid huge RAM use
+    on very long videos. Returns captured log text (from temp file) and the process.
+    """
+    log_file = tempfile.NamedTemporaryFile(
+        prefix="ssim_ffmpeg_",
+        suffix=".log",
+        delete=False,
+        mode="w+",
+        encoding="utf-8"
+    )
+    log_path = log_file.name
+
+    # Limit threads and skip audio/sub decoding to reduce RAM/CPU; SIGKILLs likely mean OOM.
+    cmd: List[str] = [
+        'ffmpeg', '-nostdin', '-threads', '1', '-filter_threads', '1',
+        '-an', '-sn', '-v', 'info'
+    ]
+    if extra:
+        cmd += extra
+    if start is not None:
+        cmd += ['-ss', f"{start:.3f}"]
+    if duration is not None:
+        cmd += ['-t', f"{duration:.3f}"]
+    cmd += ['-i', input_file]
+    if start is not None:
+        cmd += ['-ss', f"{start:.3f}"]
+    if duration is not None:
+        cmd += ['-t', f"{duration:.3f}"]
+    cmd += [
+        '-i', encoded_file,
+        '-filter_complex', filter_chain,
+        '-f', 'null', '-'
+    ]
+
+    res_local = subprocess.run(
+        cmd,
+        check=False,
+        stdout=log_file,
+        stderr=log_file,
+        text=True
+    )
+
+    log_file.flush()
+    log_file.seek(0)
+    log_text = log_file.read()
+    log_file.close()
+
+    # Only delete the temp log on success; keep it for diagnostics otherwise.
+    if res_local.returncode == 0:
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
+        log_path_ret: str | None = None
+    else:
+        log_path_ret = log_path
+
+    return log_text, res_local, log_path_ret
+
+
+def _parse_ssim(text: str) -> float | None:
+    for line in text.splitlines():
+        if 'All:' in line:
+            try:
+                return float(line.split('All:')[1].split()[0])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def _measure_ssim_once(
+    input_file: str,
+    encoded_file: str,
+    filter_chain: str,
+    extra: Sequence[str] | None = None,
+    start: float | None = None,
+    duration: float | None = None,
+) -> Tuple[float | None, subprocess.CompletedProcess[str], str, str | None]:
+    log_text, res_local, log_path = _run_ssim_ffmpeg(
+        input_file=input_file,
+        encoded_file=encoded_file,
+        filter_chain=filter_chain,
+        extra=extra,
+        start=start,
+        duration=duration,
+    )
+    val_local = _parse_ssim(log_text)
+    return val_local, res_local, log_text, log_path
+
+
+def _persist_full_ssim_logs(
+    encoded_file: str,
+    start: float | None,
+    duration: float | None,
+    log_primary: str,
+    log_fb: str,
+    log_path_primary: str | None,
+    log_path_fb: str | None,
+) -> str:
+    log_file = tempfile.NamedTemporaryFile(
+        prefix="full_ssim_",
+        suffix=".log",
+        delete=False,
+        mode="w",
+        encoding="utf-8"
+    )
+    if start is not None or duration is not None:
+        log_file.write(f"WINDOW: start={start} duration={duration}\n")
+    if log_primary:
+        log_file.write("PRIMARY LOG:\n")
+        log_file.write(log_primary)
+        log_file.write("\n")
+    if log_fb:
+        log_file.write("FALLBACK LOG:\n")
+        log_file.write(log_fb)
+        log_file.write("\n")
+    if log_path_primary:
+        log_file.write(f"PRIMARY LOG PATH (kept): {log_path_primary}\n")
+    if log_path_fb:
+        log_file.write(f"FALLBACK LOG PATH (kept): {log_path_fb}\n")
+    log_path = log_file.name
+    log_file.close()
+
+    logging.warning(
+        "Could not parse full-file SSIM for %s; treating as unavailable. See log: %s",
+        encoded_file, log_path
+    )
+    return log_path
+
+
+def _measure_ssim_window(
+    input_file: str,
+    encoded_file: str,
+    filter_chain: str,
+    start: float | None = None,
+    duration: float | None = None,
+) -> float | None:
+    val = None
+    log_primary = ""
+    log_fb = ""
+    log_path_primary: str | None = None
+    log_path_fb: str | None = None
+
+    try:
+        val, _, log_primary, log_path_primary = _measure_ssim_once(
+            input_file=input_file,
+            encoded_file=encoded_file,
+            filter_chain=filter_chain,
+            start=start,
+            duration=duration,
+        )
+    except Exception as e:
+        logging.warning(
+            "Full-file SSIM command failed for %s (%s); retrying verbose. Log: %s",
+            encoded_file, e, log_path_primary or "n/a"
+        )
+
+    if val is None or val <= 0:
+        try:
+            val_fb, _, log_fb, log_path_fb = _measure_ssim_once(
+                input_file=input_file,
+                encoded_file=encoded_file,
+                filter_chain=filter_chain,
+                extra=['-v', 'info'],
+                start=start,
+                duration=duration,
+            )
+            if val_fb is not None and val_fb > 0:
+                return val_fb
+        except Exception as e:
+            logging.warning(
+                "Fallback full-file SSIM failed for %s (%s). Primary log: %s Fallback log: %s",
+                encoded_file, e, log_path_primary or "n/a", log_path_fb or "n/a"
+            )
+
+    if val is not None and val > 0:
+        return val
+
+    _persist_full_ssim_logs(
+        encoded_file=encoded_file,
+        start=start,
+        duration=duration,
+        log_primary=log_primary,
+        log_fb=log_fb,
+        log_path_primary=log_path_primary,
+        log_path_fb=log_path_fb,
+    )
+    return None
+
+
+def _measure_ssim_in_chunks(
+    input_file: str,
+    encoded_file: str,
+    filter_chain: str,
+    chunk_seconds: float,
+) -> float | None:
+    duration_total = probe_video_duration(input_file)
+    if duration_total <= chunk_seconds:
+        return None
+
+    acc = 0.0
+    weight = 0.0
+    start = 0.0
+    while start < duration_total:
+        window = min(chunk_seconds, duration_total - start)
+        val_window = _measure_ssim_window(
+            input_file=input_file,
+            encoded_file=encoded_file,
+            filter_chain=filter_chain,
+            start=start,
+            duration=window,
+        )
+        if val_window is None:
+            return None
+        acc += val_window * window
+        weight += window
+        start += window
+
+    if weight > 0:
+        return acc / weight
+    return None
+
+
 def measure_full_ssim(
     input_file: str,
     encoded_file: str,
@@ -25,171 +274,23 @@ def measure_full_ssim(
     Returns None if parsing fails or SSIM is invalid.
     """
     print("Measuring full-file SSIM...")
-    # Normalize timestamps (and optionally FPS) to avoid large frame sync buffers
-    # that can blow up RAM on long or VFR sources.
-    if raw_fr and raw_fr > 0:
-        fr_str = f"{raw_fr:.6f}".rstrip("0").rstrip(".")
-        filter_chain = (
-            f"[0:v]fps={fr_str},setpts=PTS-STARTPTS[ref];"
-            f"[1:v]fps={fr_str},setpts=PTS-STARTPTS[dist];"
-            "[ref][dist]ssim"
-        )
-    else:
-        filter_chain = (
-            "[0:v]setpts=PTS-STARTPTS[ref];"
-            "[1:v]setpts=PTS-STARTPTS[dist];"
-            "[ref][dist]ssim"
-        )
-
-    def _run_ffmpeg(
-        extra: Sequence[str] | None = None,
-        start: float | None = None,
-        duration: float | None = None,
-    ) -> tuple[str, subprocess.CompletedProcess[str], str | None]:
-        """
-        Run ffmpeg, streaming output to a temp file (not memory) to avoid huge RAM use
-        on very long videos. Returns captured log text (from temp file) and the process.
-        """
-        log_file = tempfile.NamedTemporaryFile(prefix="ssim_ffmpeg_", suffix=".log", delete=False, mode="w+", encoding="utf-8")
-        log_path = log_file.name
-
-        # Limit threads and skip audio/sub decoding to reduce RAM/CPU; SIGKILLs likely mean OOM.
-        cmd: List[str] = [
-            'ffmpeg', '-nostdin', '-threads', '1', '-filter_threads', '1',
-            '-an', '-sn', '-v', 'info'
-        ]
-        if extra:
-            cmd += extra
-        if start is not None:
-            cmd += ['-ss', f"{start:.3f}"]
-        if duration is not None:
-            cmd += ['-t', f"{duration:.3f}"]
-        cmd += ['-i', input_file]
-        if start is not None:
-            cmd += ['-ss', f"{start:.3f}"]
-        if duration is not None:
-            cmd += ['-t', f"{duration:.3f}"]
-        cmd += [
-            '-i', encoded_file,
-            '-filter_complex', filter_chain,
-            '-f', 'null', '-'
-        ]
-
-        res_local = subprocess.run(
-            cmd,
-            check=False,
-            stdout=log_file,
-            stderr=log_file,
-            text=True
-        )
-
-        log_file.flush()
-        log_file.seek(0)
-        log_text = log_file.read()
-        log_file.close()
-
-        # Only delete the temp log on success; keep it for diagnostics otherwise.
-        if res_local.returncode == 0:
-            try:
-                os.remove(log_path)
-            except OSError:
-                pass
-            log_path_ret: str | None = None
-        else:
-            log_path_ret = log_path
-
-        return log_text, res_local, log_path_ret
-
-    def _parse_ssim(text: str) -> float | None:
-        for line in text.splitlines():
-            if 'All:' in line:
-                try:
-                    return float(line.split('All:')[1].split()[0])
-                except (ValueError, IndexError):
-                    return None
-        return None
-
-    def _measure(
-        extra: Sequence[str] | None = None,
-        start: float | None = None,
-        duration: float | None = None,
-    ) -> Tuple[float | None, subprocess.CompletedProcess[str], str, str | None]:
-        log_text, res_local, log_path = _run_ffmpeg(extra=extra, start=start, duration=duration)
-        val_local = _parse_ssim(log_text)
-        return val_local, res_local, log_text, log_path
-
-    def _measure_window(start: float | None = None, duration: float | None = None) -> float | None:
-        val = None
-        log_primary = ""
-        log_fb = ""
-        log_path_primary: str | None = None
-        log_path_fb: str | None = None
-
-        try:
-            val, _, log_primary, log_path_primary = _measure(start=start, duration=duration)
-        except Exception as e:
-            logging.warning(
-                "Full-file SSIM command failed for %s (%s); retrying verbose. Log: %s",
-                encoded_file, e, log_path_primary or "n/a"
-            )
-
-        if val is None or val <= 0:
-            try:
-                val_fb, _, log_fb, log_path_fb = _measure(extra=['-v', 'info'], start=start, duration=duration)
-                if val_fb is not None and val_fb > 0:
-                    return val_fb
-            except Exception as e:
-                logging.warning(
-                    "Fallback full-file SSIM failed for %s (%s). Primary log: %s Fallback log: %s",
-                    encoded_file, e, log_path_primary or "n/a", log_path_fb or "n/a"
-                )
-
-        if val is not None and val > 0:
-            return val
-
-        # Persist logs to aid debugging
-        log_file = tempfile.NamedTemporaryFile(prefix="full_ssim_", suffix=".log", delete=False, mode="w", encoding="utf-8")
-        if start is not None or duration is not None:
-            log_file.write(f"WINDOW: start={start} duration={duration}\n")
-        if log_primary:
-            log_file.write("PRIMARY LOG:\n")
-            log_file.write(log_primary)
-            log_file.write("\n")
-        if log_fb:
-            log_file.write("FALLBACK LOG:\n")
-            log_file.write(log_fb)
-            log_file.write("\n")
-        if log_path_primary:
-            log_file.write(f"PRIMARY LOG PATH (kept): {log_path_primary}\n")
-        if log_path_fb:
-            log_file.write(f"FALLBACK LOG PATH (kept): {log_path_fb}\n")
-        log_path = log_file.name
-        log_file.close()
-
-        logging.warning(
-            "Could not parse full-file SSIM for %s; treating as unavailable. See log: %s",
-            encoded_file, log_path
-        )
-        return None
+    filter_chain = _build_ssim_filter_chain(raw_fr)
 
     if chunk_seconds and chunk_seconds > 0:
-        duration_total = probe_video_duration(input_file)
-        if duration_total > chunk_seconds:
-            acc = 0.0
-            weight = 0.0
-            start = 0.0
-            while start < duration_total:
-                window = min(chunk_seconds, duration_total - start)
-                val_window = _measure_window(start=start, duration=window)
-                if val_window is None:
-                    return None
-                acc += val_window * window
-                weight += window
-                start += window
-            if weight > 0:
-                return acc / weight
+        chunked = _measure_ssim_in_chunks(
+            input_file=input_file,
+            encoded_file=encoded_file,
+            filter_chain=filter_chain,
+            chunk_seconds=chunk_seconds,
+        )
+        if chunked is not None:
+            return chunked
 
-    return _measure_window()
+    return _measure_ssim_window(
+        input_file=input_file,
+        encoded_file=encoded_file,
+        filter_chain=filter_chain,
+    )
 
 
 def build_hdr_sdr_filter(hdr: Dict[str, Any]) -> str | None:

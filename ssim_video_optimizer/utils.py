@@ -4,7 +4,7 @@ import logging
 import os
 import subprocess
 import tempfile
-from typing import Any, Dict, List, Sequence, Optional
+from typing import Any, Dict, IO, List, Optional, Sequence
 
 from tqdm import tqdm
 
@@ -57,6 +57,21 @@ def run_ffmpeg_progress(cmd: Sequence[Any], total_duration: float, desc: str = "
     desc: label for tqdm
     """
 
+    progress_cmd = _inject_ffmpeg_progress(cmd)
+    logging.debug("Running FFmpeg (with progress): %s", " ".join(progress_cmd))
+
+    log_file, log_path = _open_ffmpeg_progress_log()
+    process = _spawn_ffmpeg_progress(progress_cmd, log_file)
+    pbar, last_time = _start_progress_bar(total_duration, desc)
+    _consume_progress_output(process, pbar, last_time)
+    process.wait()
+    pbar.close()
+    log_file.flush()
+    log_file.close()
+    _finalize_ffmpeg_progress(process, progress_cmd, log_path)
+
+
+def _inject_ffmpeg_progress(cmd: Sequence[Any]) -> List[str]:
     # Inject -progress pipe:1 -nostats before first "-i"
     progress_cmd: List[str] = []
     inserted = False
@@ -65,9 +80,10 @@ def run_ffmpeg_progress(cmd: Sequence[Any], total_duration: float, desc: str = "
             progress_cmd += ["-progress", "pipe:1", "-nostats"]
             inserted = True
         progress_cmd.append(token)
+    return progress_cmd
 
-    logging.debug("Running FFmpeg (with progress): %s", " ".join(progress_cmd))
 
+def _open_ffmpeg_progress_log() -> tuple[IO[str], str]:
     # Capture stderr to a temp file so we can surface the reason on failures.
     log_file = tempfile.NamedTemporaryFile(
         prefix="ffmpeg_progress_",
@@ -76,9 +92,14 @@ def run_ffmpeg_progress(cmd: Sequence[Any], total_duration: float, desc: str = "
         mode="w+",
         encoding="utf-8"
     )
-    log_path = log_file.name
+    return log_file, log_file.name
 
-    process = subprocess.Popen(
+
+def _spawn_ffmpeg_progress(
+    progress_cmd: Sequence[Any],
+    log_file: IO[str],
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
         progress_cmd,
         stdout=subprocess.PIPE,
         stderr=log_file,
@@ -86,14 +107,18 @@ def run_ffmpeg_progress(cmd: Sequence[Any], total_duration: float, desc: str = "
         bufsize=1
     )
 
+
+def _start_progress_bar(total_duration: float, desc: str) -> tuple[tqdm, float]:
     pbar = tqdm(
         total=total_duration,
         desc=desc,
         unit="s",
         bar_format="{l_bar}{bar}| {n:.2f}/{total:.2f} {unit}",
     )
-    last_time = 0.0
+    return pbar, 0.0
 
+
+def _consume_progress_output(process: subprocess.Popen[str], pbar: tqdm, last_time: float) -> None:
     if process.stdout:
         for line in process.stdout:
             line = line.strip()
@@ -108,22 +133,23 @@ def run_ffmpeg_progress(cmd: Sequence[Any], total_duration: float, desc: str = "
             elif line == "progress=end":
                 break
 
-    process.wait()
-    pbar.close()
-    log_file.flush()
-    log_file.close()
 
+def _finalize_ffmpeg_progress(
+    process: subprocess.Popen[str],
+    progress_cmd: Sequence[Any],
+    log_path: str,
+) -> None:
     if process.returncode != 0:
         logging.error("FFmpeg failed (code=%s). Full log: %s", process.returncode, log_path)
         err = subprocess.CalledProcessError(process.returncode, progress_cmd)
         err.ffmpeg_log = log_path  # type: ignore[attr-defined]
         raise err
-    else:
-        # Clean up the log on success
-        try:
-            os.remove(log_path)
-        except OSError:
-            pass
+
+    # Clean up the log on success
+    try:
+        os.remove(log_path)
+    except OSError:
+        pass
 
 
 # ────────────────────────────────────────────────
@@ -143,28 +169,36 @@ def build_audio_options(
     """
     opts: List[str] = []
     for i, s in enumerate(streams):
-        codec = s.get('codec_name', '')
-        ch = int(s.get('channels') or 2)
-        bitrate = 64 * ch
-        if normalize:
-            opts += [
-                f'-filter:a:{i}', loudnorm_filter,
-                f'-c:a:{i}', 'aac',
-                f'-b:a:{i}', f'{bitrate}k',
-                f'-ac:{i}', str(ch)
-            ]
-        else:
-            if codec != 'aac':
-                opts += [
-                    f'-c:a:{i}', 'aac',
-                    f'-b:a:{i}', f'{bitrate}k',
-                    f'-ac:{i}', str(ch)
-                ]
-            else:
-                opts += [
-                    f'-c:a:{i}', 'copy'
-                ]
+        opts += _audio_opts_for_stream(i, s, normalize, loudnorm_filter)
     return opts
+
+
+def _audio_opts_for_stream(
+    index: int,
+    stream: Dict[str, Any],
+    normalize: bool,
+    loudnorm_filter: str,
+) -> List[str]:
+    codec = stream.get('codec_name', '')
+    ch = int(stream.get('channels') or 2)
+    bitrate = 64 * ch
+
+    if normalize:
+        return [
+            f'-filter:a:{index}', loudnorm_filter,
+            f'-c:a:{index}', 'aac',
+            f'-b:a:{index}', f'{bitrate}k',
+            f'-ac:{index}', str(ch)
+        ]
+
+    if codec != 'aac':
+        return [
+            f'-c:a:{index}', 'aac',
+            f'-b:a:{index}', f'{bitrate}k',
+            f'-ac:{index}', str(ch)
+        ]
+
+    return [f'-c:a:{index}', 'copy']
 
 
 # ────────────────────────────────────────────────

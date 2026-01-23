@@ -86,6 +86,97 @@ def _pick_from_candidates(candidates: List[float], count: int, duration: float, 
     return sorted(set(picked))
 
 
+def _compute_uniform_times(duration: float, percent: float, count: int) -> tuple[List[float], float]:
+    span = duration * percent / 100.0
+    step = max((duration - span) / max(count - 1, 1), 0)
+    uniform_times: List[float] = [i * step for i in range(count)]
+    return uniform_times, span
+
+
+def _resolve_clip_len(clip_len: float | None, span: float, count: int) -> float:
+    if clip_len is None:
+        return span / count if count > 0 else 0.0
+    return clip_len
+
+
+def _scene_threshold_for_mode(sampling_mode: str) -> float | None:
+    if sampling_mode == 'scene':
+        return 0.30
+    if sampling_mode == 'motion':
+        return 0.10
+    return None
+
+
+def _select_base_times(
+    input_file: str,
+    sampling_mode: str,
+    uniform_times: List[float],
+    duration: float,
+    clip_len: float,
+    count: int,
+) -> List[float]:
+    if sampling_mode == 'uniform':
+        return uniform_times
+
+    threshold = _scene_threshold_for_mode(sampling_mode)
+    if threshold is None:
+        return uniform_times
+
+    print("Analyzing video for scene changes to select sample points...")
+    candidates = _detect_scene_times(input_file, threshold=threshold)
+    picked = _pick_from_candidates(candidates, count, duration, clip_len)
+    return picked or uniform_times
+
+
+def _clamp_time(t: float, duration: float, clip_len: float) -> float:
+    return max(0.0, min(t, max(duration - clip_len, 0)))
+
+
+def _filter_and_pad_times(
+    base_times: List[float],
+    uniform_times: List[float],
+    duration: float,
+    clip_len: float,
+    count: int,
+) -> List[float]:
+    filtered = _filter_times(base_times, duration, clip_len, count)
+    if len(filtered) < count:
+        filtered = _pad_times(filtered, uniform_times, duration, clip_len, count)
+    return sorted(filtered)
+
+
+def _filter_times(
+    times: List[float],
+    duration: float,
+    clip_len: float,
+    count: int,
+) -> List[float]:
+    filtered: List[float] = []
+    for t in times:
+        t_clamped = _clamp_time(t, duration, clip_len)
+        if all(abs(t_clamped - prev) >= clip_len for prev in filtered):
+            filtered.append(t_clamped)
+            if len(filtered) == count:
+                break
+    return filtered
+
+
+def _pad_times(
+    filtered: List[float],
+    uniform_times: List[float],
+    duration: float,
+    clip_len: float,
+    count: int,
+) -> List[float]:
+    for t in uniform_times:
+        t_clamped = _clamp_time(t, duration, clip_len)
+        if all(abs(t_clamped - prev) >= clip_len for prev in filtered):
+            filtered.append(t_clamped)
+            if len(filtered) == count:
+                break
+    return filtered
+
+
 def select_sample_times(
     input_file: str,
     percent: float,
@@ -105,58 +196,25 @@ def select_sample_times(
     if duration <= 0:
         return []
 
-    span = duration * percent / 100.0
-    step = max((duration - span) / max(count - 1, 1), 0)
-    uniform_times: List[float] = [i * step for i in range(count)]
+    uniform_times, span = _compute_uniform_times(duration, percent, count)
+    clip_len = _resolve_clip_len(clip_len, span, count)
 
-    if clip_len is None:
-        clip_len = span / count if count > 0 else 0.0
+    base_times = _select_base_times(
+        input_file=input_file,
+        sampling_mode=sampling_mode,
+        uniform_times=uniform_times,
+        duration=duration,
+        clip_len=clip_len,
+        count=count,
+    )
 
-    # Always guarantee we have a uniform baseline
-    if sampling_mode == 'uniform':
-        base_times = uniform_times
-    else:
-        # Scene-based candidates
-        if sampling_mode == 'scene':
-            threshold = 0.30
-        elif sampling_mode == 'motion':
-            threshold = 0.10
-        else:
-            # Fallback: unknown mode → uniform
-            threshold = None
-
-        if threshold is None:
-            base_times = uniform_times
-        else:
-            print("Analyzing video for scene changes to select sample points...")
-            candidates = _detect_scene_times(input_file, threshold=threshold)
-            picked = _pick_from_candidates(candidates, count, duration, clip_len)
-
-            if picked:
-                base_times = picked
-            else:
-                # Fallback if scene detection failed or gave no usable times
-                base_times = uniform_times
-
-    # Ensure spacing at least clip_len and clamp within duration
-    filtered: List[float] = []
-    for t in base_times:
-        t_clamped = max(0.0, min(t, max(duration - clip_len, 0)))
-        if all(abs(t_clamped - prev) >= clip_len for prev in filtered):
-            filtered.append(t_clamped)
-            if len(filtered) == count:
-                break
-
-    # If we still have fewer than count, pad with uniform times
-    if len(filtered) < count:
-        for t in uniform_times:
-            t_clamped = max(0.0, min(t, max(duration - clip_len, 0)))
-            if all(abs(t_clamped - prev) >= clip_len for prev in filtered):
-                filtered.append(t_clamped)
-                if len(filtered) == count:
-                    break
-
-    return sorted(filtered)
+    return _filter_and_pad_times(
+        base_times=base_times,
+        uniform_times=uniform_times,
+        duration=duration,
+        clip_len=clip_len,
+        count=count,
+    )
 
 
 def extract_samples(

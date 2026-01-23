@@ -3,7 +3,7 @@ requires = ["setuptools>=64.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ssim-video-optimizer"
+name = "qpreserve"
 version = "0.1.0"
 description = "SSIM-based video encoder optimizer"
 readme = "README.md"
@@ -14,4 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ssim-video-optimizer = "ssim_video_optimizer.cli:main"
+qpreserve = "ssim_video_optimizer.cli:main"
+
+[tool.setuptools]
+packages = ["ssim_video_optimizer"]

@@ -97,7 +97,7 @@ for f in "${FILES[@]}"; do
 
     echo "PROCESS: $f"
     found_any=1
-    if ! ssim-video-optimizer "$f"; then
+    if ! qpreserve "$f"; then
         echo "FAIL (optimizer exited non-zero): $f"
         continue
     fi

@@ -12,7 +12,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ssim-video-optimizer"
+name = "qpreserve"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

@@ -1,6 +1,6 @@
 # __init__.py
 """
-ssim_video_optimizer
+QPreserve (ssim_video_optimizer)
 
 A command-line toolkit for optimizing H.264 encoding QP values by targeting
 a user-specified SSIM threshold. Provides sampling strategies (scene, motion,

@@ -78,13 +78,18 @@ def _run_ssim_ffmpeg(
 
 
 def _parse_ssim(text: str) -> float | None:
+    values: List[float] = []
     for line in text.splitlines():
         if 'All:' in line:
             try:
-                return float(line.split('All:')[1].split()[0])
+                values.append(float(line.split('All:')[1].split()[0]))
             except (ValueError, IndexError):
-                return None
-    return None
+                continue
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return sum(values) / len(values)
 
 
 def _measure_ssim_once(
@@ -104,6 +109,8 @@ def _measure_ssim_once(
         duration=duration,
     )
     val_local = _parse_ssim(stdout_text)
+    if val_local is None:
+        val_local = _parse_ssim(stderr_text)
     return val_local, res_local, stdout_text, stderr_text
 
 
@@ -472,9 +479,16 @@ def encode_final(
 
     base_in, _ = os.path.splitext(os.path.basename(input_file))
     base = output_base or base_in
-    # Default to MKV for final optimized output; allow override when explicitly provided.
+    # Default to MKV for final optimized output; allow safe overrides only.
     if output_ext:
         ext = output_ext if output_ext.startswith(".") else f".{output_ext}"
+        safe_exts = {".mkv", ".mp4"}
+        if ext.lower() not in safe_exts:
+            logging.warning(
+                "Output extension %s is not supported for final encode; using .mkv instead.",
+                ext
+            )
+            ext = ".mkv"
     else:
         ext = ".mkv"
     total_duration = probe_video_duration(input_file)

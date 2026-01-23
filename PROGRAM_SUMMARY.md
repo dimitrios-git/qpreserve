@@ -1,4 +1,4 @@
-# SSIM Video Optimizer – Code Overview
+# QPreserve – Code Overview
 
 ## Purpose
 
@@ -23,7 +23,7 @@
 - `ssim_search.py`: Sample re-encode + SSIM measurement (lightweight ffmpeg runs) and binary search to pick QP.  
 - `probes.py`: FFprobe wrappers for duration, framerate, HDR metadata, stream info.  
 - `utils.py`: Command runner, FFmpeg progress integration (uses `-progress` + tqdm), audio option builder (copy AAC else encode AAC @64 kbps/channel), filter availability helper.  
-- `batch.sh`: Finds video files recursively, skips already converted/tagged outputs, and runs `ssim-video-optimizer` per file; removes tiny outputs and continues on errors.
+- `batch.sh`: Finds video files recursively, skips already converted/tagged outputs, and runs `qpreserve` per file; removes tiny outputs and continues on errors.
 
 ## Assumptions and Notable Behaviors
 
@@ -36,7 +36,7 @@
 ## Entry Points
 
 - Python: `python -m ssim_video_optimizer` or `ssim_video_optimizer.cli:main`.  
-- CLI script: `ssim-video-optimizer` (installed via packaging).  
+- CLI script: `qpreserve` (installed via packaging).  
 - Batch helper: `ssim_video_optimizer/batch.sh` for directory-wide processing.
 
 ## Next Features and Plans (ideas)

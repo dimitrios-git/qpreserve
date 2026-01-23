@@ -1,4 +1,4 @@
-# SSIM Video Optimizer
+# QPreserve
 
 A command-line tool to find the optimal H.264 encoding quality for any video by targeting a user-specified SSIM threshold.  
 It samples your video (via scene changes, motion peaks, or uniform intervals), measures SSIM on those clips across a QP range, and does a binary search to identify the lowest QP that still meets your quality goal—then applies that to the full file.

@@ -1,6 +1,6 @@
 # cli.py
 """
-Command-line interface for ssim_video_optimizer.
+Command-line interface for QPreserve (ssim_video_optimizer).
 
 Coordinates:
   - baseline generation (QP 0, optional HDR->SDR)

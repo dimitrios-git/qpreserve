@@ -6,7 +6,7 @@ It samples your video (via scene changes, motion peaks, or uniform intervals), m
 ## Key Features
 
 - **Automated SSIM-guided QP search**  
-  Samples representative segments and runs a binary search over QP values to hit a target SSIM (default 0.98).
+  Samples representative segments and runs a binary search over QP values to hit a target SSIM.
 
 - **Flexible sampling modes**  
   Choose between uniform intervals, FFprobe scene-change detection, or motion peaks for smarter clip selection.

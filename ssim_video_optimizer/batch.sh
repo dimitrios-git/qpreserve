@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Batch runner:
 # - Streams optimizer output
-# - Skips files that already have a tagged conversion `[h264_nvenc qp XX]`
+# - Skips files that already have a tagged conversion `[h264_nvenc XXXpYY qp ZZ]`
 # - Uses container logic from the Python code (mp4 inputs → mp4 outputs, otherwise mkv)
 # - Continues on individual failures
 
@@ -14,17 +14,19 @@ found_any=0
 find_converted() {
     local dir="$1" name="$2" ext="$3"
     python3 - <<'PY' "$dir" "$name" "$ext"
-import os, sys
+import os, sys, re
 dir_path, src_name, out_ext = sys.argv[1:]
-tag = "[h264_nvenc qp "
+# Updated pattern to match: [h264_nvenc 1080p60 qp 21]
+tag_pattern = re.compile(r'\[h264_nvenc \d+p\d+ qp \d+\]')
 best = None
 for fn in os.listdir(dir_path):
-    if tag not in fn:
+    if not tag_pattern.search(fn):
         continue
     base, ext = os.path.splitext(fn)
     if ext.lower() != f".{out_ext.lower()}":
         continue
-    if not base.startswith(src_name + " [h264_nvenc qp "):
+    # Check if filename starts with the source name
+    if not base.startswith(src_name + " [h264_nvenc "):
         continue
     path = os.path.join(dir_path, fn)
     try:
@@ -69,7 +71,8 @@ for f in "${FILES[@]}"; do
     if [[ "$mime" != video/* && "$mime" != "application/octet-stream" ]]; then
         continue
     fi
-
+# Updated pattern to match: [h264_nvenc 1080p60 qp 21] or [baseline qp 0]
+    if [[ "$name" =~ \[h264_nvenc\ [0-9]+p[0-9]+\ qp\ [0-9]+\] ]] || [[ "$name" =~ \[baseline
     # Skip files that are already tagged outputs (baseline or encoded)
     if [[ "$name" =~ \[(h264_nvenc|baseline)\ qp\ [0-9]+\] ]]; then
         echo "SKIP (tagged output): $f"

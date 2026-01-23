@@ -128,6 +128,7 @@ def select_sample_times(
         if threshold is None:
             base_times = uniform_times
         else:
+            print("Analyzing video for scene changes to select sample points...")
             candidates = _detect_scene_times(input_file, threshold=threshold)
             picked = _pick_from_candidates(candidates, count, duration, clip_len)
 
@@ -165,15 +166,16 @@ def extract_samples(
     sample_qp: int,
     audio_opts: list[str],
     raw_fr: float,
-    sampling_mode: str = 'uniform'
-) -> list[str]:
+    sampling_mode: str = 'uniform',
+    tmp_root: str | None = None,
+) -> tuple[list[str], str]:
     """
     Extract and re-encode sample clips from the given input file,
     according to the chosen sampling_mode.
     """
     duration = probe_video_duration(input_file)
     if duration <= 0:
-        return []
+        return [], ""
 
     clip_len = duration * percent / 100.0 / max(count, 1)
 
@@ -185,7 +187,10 @@ def extract_samples(
         sampling_mode=sampling_mode
     )
 
-    tmpdir = tempfile.mkdtemp(prefix="ssim_sample_")
+    if not times:
+        return [], ""
+
+    tmpdir = tempfile.mkdtemp(prefix="ssim_sample_", dir=tmp_root)
     samples: list[str] = []
 
     for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
@@ -214,4 +219,4 @@ def extract_samples(
 
         samples.append(sample_file)
 
-    return samples
+    return samples, tmpdir

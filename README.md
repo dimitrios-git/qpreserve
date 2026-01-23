@@ -6,7 +6,7 @@ It samples your video (via scene changes, motion peaks, or uniform intervals), m
 ## Key Features
 
 - **Automated SSIM-guided QP search**  
-  Samples representative segments and runs a binary search over QP values to hit a target SSIM (default 0.99).
+  Samples representative segments and runs a binary search over QP values to hit a target SSIM (default 0.98).
 
 - **Flexible sampling modes**  
   Choose between uniform intervals, FFprobe scene-change detection, or motion peaks for smarter clip selection.
@@ -18,8 +18,4 @@ It samples your video (via scene changes, motion peaks, or uniform intervals), m
   Automatically copies or converts audio streams to AAC at matching bitrates/channels.
 
 - **Zero-dependency install**  
-  Just FFmpeg (with CUDA support) and Python; packaging via Conda makes setup a breeze.
-
----
-
-*(Further sections: Installation • Usage • Development • Testing • License)*
+  Just FFmpeg (with CUDA support) and Python; use `uv` to run and manage the project environment.

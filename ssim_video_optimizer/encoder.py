@@ -14,13 +14,38 @@ from .probes import (
 )
 
 
-def measure_full_ssim(input_file: str, encoded_file: str) -> float | None:
+def measure_full_ssim(
+    input_file: str,
+    encoded_file: str,
+    raw_fr: float | None = None,
+    chunk_seconds: float | None = None,
+) -> float | None:
     """
     Measure full-file SSIM between input_file (reference) and encoded_file (distorted).
     Returns None if parsing fails or SSIM is invalid.
     """
+    print("Measuring full-file SSIM...")
+    # Normalize timestamps (and optionally FPS) to avoid large frame sync buffers
+    # that can blow up RAM on long or VFR sources.
+    if raw_fr and raw_fr > 0:
+        fr_str = f"{raw_fr:.6f}".rstrip("0").rstrip(".")
+        filter_chain = (
+            f"[0:v]fps={fr_str},setpts=PTS-STARTPTS[ref];"
+            f"[1:v]fps={fr_str},setpts=PTS-STARTPTS[dist];"
+            "[ref][dist]ssim"
+        )
+    else:
+        filter_chain = (
+            "[0:v]setpts=PTS-STARTPTS[ref];"
+            "[1:v]setpts=PTS-STARTPTS[dist];"
+            "[ref][dist]ssim"
+        )
 
-    def _run_ffmpeg(extra: Sequence[str] | None = None) -> tuple[str, subprocess.CompletedProcess[str], str | None]:
+    def _run_ffmpeg(
+        extra: Sequence[str] | None = None,
+        start: float | None = None,
+        duration: float | None = None,
+    ) -> tuple[str, subprocess.CompletedProcess[str], str | None]:
         """
         Run ffmpeg, streaming output to a temp file (not memory) to avoid huge RAM use
         on very long videos. Returns captured log text (from temp file) and the process.
@@ -35,9 +60,18 @@ def measure_full_ssim(input_file: str, encoded_file: str) -> float | None:
         ]
         if extra:
             cmd += extra
+        if start is not None:
+            cmd += ['-ss', f"{start:.3f}"]
+        if duration is not None:
+            cmd += ['-t', f"{duration:.3f}"]
+        cmd += ['-i', input_file]
+        if start is not None:
+            cmd += ['-ss', f"{start:.3f}"]
+        if duration is not None:
+            cmd += ['-t', f"{duration:.3f}"]
         cmd += [
-            '-i', input_file, '-i', encoded_file,
-            '-filter_complex', 'ssim',
+            '-i', encoded_file,
+            '-filter_complex', filter_chain,
             '-f', 'null', '-'
         ]
 
@@ -75,58 +109,87 @@ def measure_full_ssim(input_file: str, encoded_file: str) -> float | None:
                     return None
         return None
 
-    def _measure(extra: Sequence[str] | None = None) -> Tuple[float | None, subprocess.CompletedProcess[str], str, str | None]:
-        log_text, res_local, log_path = _run_ffmpeg(extra=extra)
+    def _measure(
+        extra: Sequence[str] | None = None,
+        start: float | None = None,
+        duration: float | None = None,
+    ) -> Tuple[float | None, subprocess.CompletedProcess[str], str, str | None]:
+        log_text, res_local, log_path = _run_ffmpeg(extra=extra, start=start, duration=duration)
         val_local = _parse_ssim(log_text)
         return val_local, res_local, log_text, log_path
 
-    val = None
-    log_primary = ""
-    log_fb = ""
-    log_path_primary: str | None = None
-    log_path_fb: str | None = None
+    def _measure_window(start: float | None = None, duration: float | None = None) -> float | None:
+        val = None
+        log_primary = ""
+        log_fb = ""
+        log_path_primary: str | None = None
+        log_path_fb: str | None = None
 
-    try:
-        val, _, log_primary, log_path_primary = _measure()
-    except Exception as e:
-        logging.warning(
-            "Full-file SSIM command failed for %s (%s); retrying verbose. Log: %s",
-            encoded_file, e, log_path_primary or "n/a"
-        )
-
-    if val is None or val <= 0:
         try:
-            val_fb, _, log_fb, log_path_fb = _measure(extra=['-v', 'info'])
-            if val_fb is not None and val_fb > 0:
-                return val_fb
+            val, _, log_primary, log_path_primary = _measure(start=start, duration=duration)
         except Exception as e:
             logging.warning(
-                "Fallback full-file SSIM failed for %s (%s). Primary log: %s Fallback log: %s",
-                encoded_file, e, log_path_primary or "n/a", log_path_fb or "n/a"
+                "Full-file SSIM command failed for %s (%s); retrying verbose. Log: %s",
+                encoded_file, e, log_path_primary or "n/a"
             )
 
-    if val is not None and val > 0:
-        return val
+        if val is None or val <= 0:
+            try:
+                val_fb, _, log_fb, log_path_fb = _measure(extra=['-v', 'info'], start=start, duration=duration)
+                if val_fb is not None and val_fb > 0:
+                    return val_fb
+            except Exception as e:
+                logging.warning(
+                    "Fallback full-file SSIM failed for %s (%s). Primary log: %s Fallback log: %s",
+                    encoded_file, e, log_path_primary or "n/a", log_path_fb or "n/a"
+                )
 
-    # Persist logs to aid debugging
-    log_file = tempfile.NamedTemporaryFile(prefix="full_ssim_", suffix=".log", delete=False, mode="w", encoding="utf-8")
-    if log_primary:
-        log_file.write("PRIMARY LOG:\n")
-        log_file.write(log_primary)
-        log_file.write("\n")
-    if log_fb:
-        log_file.write("FALLBACK LOG:\n")
-        log_file.write(log_fb)
-        log_file.write("\n")
-    if log_path_primary:
-        log_file.write(f"PRIMARY LOG PATH (kept): {log_path_primary}\n")
-    if log_path_fb:
-        log_file.write(f"FALLBACK LOG PATH (kept): {log_path_fb}\n")
-    log_path = log_file.name
-    log_file.close()
+        if val is not None and val > 0:
+            return val
 
-    logging.warning("Could not parse full-file SSIM for %s; treating as unavailable. See log: %s", encoded_file, log_path)
-    return None
+        # Persist logs to aid debugging
+        log_file = tempfile.NamedTemporaryFile(prefix="full_ssim_", suffix=".log", delete=False, mode="w", encoding="utf-8")
+        if start is not None or duration is not None:
+            log_file.write(f"WINDOW: start={start} duration={duration}\n")
+        if log_primary:
+            log_file.write("PRIMARY LOG:\n")
+            log_file.write(log_primary)
+            log_file.write("\n")
+        if log_fb:
+            log_file.write("FALLBACK LOG:\n")
+            log_file.write(log_fb)
+            log_file.write("\n")
+        if log_path_primary:
+            log_file.write(f"PRIMARY LOG PATH (kept): {log_path_primary}\n")
+        if log_path_fb:
+            log_file.write(f"FALLBACK LOG PATH (kept): {log_path_fb}\n")
+        log_path = log_file.name
+        log_file.close()
+
+        logging.warning(
+            "Could not parse full-file SSIM for %s; treating as unavailable. See log: %s",
+            encoded_file, log_path
+        )
+        return None
+
+    if chunk_seconds and chunk_seconds > 0:
+        duration_total = probe_video_duration(input_file)
+        if duration_total > chunk_seconds:
+            acc = 0.0
+            weight = 0.0
+            start = 0.0
+            while start < duration_total:
+                window = min(chunk_seconds, duration_total - start)
+                val_window = _measure_window(start=start, duration=window)
+                if val_window is None:
+                    return None
+                acc += val_window * window
+                weight += window
+                start += window
+            if weight > 0:
+                return acc / weight
+
+    return _measure_window()
 
 
 def build_hdr_sdr_filter(hdr: Dict[str, Any]) -> str | None:
@@ -183,20 +246,56 @@ def _is_low_res(path: str) -> bool:
     return max_dim <= 720
 
 
+def _get_resolution_label(path: str) -> str:
+    """
+    Return a standardized resolution label based on the video's actual dimensions.
+    Maps to common standards: 480p, 720p, 1080p, 1440p, 2160p (4K), etc.
+    
+    Uses the larger dimension (usually height for landscape, width for portrait)
+    to determine the closest standard resolution.
+    """
+    info = probe_video_stream_info(path)
+    w = info["width"]
+    h = info["height"]
+    
+    # Use the smaller dimension for classification (usually height in landscape)
+    # This handles both landscape and portrait correctly
+    min_dim = min(w, h)
+    
+    # Map to standard resolutions with some tolerance
+    if min_dim <= 360:
+        return "360p"
+    elif min_dim <= 480:
+        return "480p"
+    elif min_dim <= 576:
+        return "576p"  # PAL SD
+    elif min_dim <= 720:
+        return "720p"
+    elif min_dim <= 1080:
+        return "1080p"
+    elif min_dim <= 1440:
+        return "1440p"  # 2K
+    elif min_dim <= 2160:
+        return "2160p"  # 4K UHD
+    elif min_dim <= 4320:
+        return "4320p"  # 8K
+    else:
+        return f"{min_dim}p"  # Fallback for unusual resolutions
+
+
 def encode_baseline(input_file: str, output_dir: str | None = None) -> str:
     """
     Step 0 + 1: Create the "baseline" file from the ORIGINAL source.
 
     - Detect HDR and apply HDR->SDR tonemapping if needed.
     - Normalize to SDR BT.709, yuv420p, SAR=1.
-    - For low-res sources (<=720p):
-        * Use libx264 lossless-ish baseline (QP=0, preset=veryslow).
-        * Avoid all NVENC bugs / crashes on SD.
-    - For higher resolutions:
-        * Use H.264 NVENC in constqp mode:
-            - QP=0
-            - preset=p7
-            - bf=2
+    - Attempt H.264 NVENC in constqp mode:
+        - QP=0
+        - preset=p7
+        - bf=2
+    - If NVENC fails, fall back to libx264 lossless-ish baseline:
+        - QP=0
+        - preset=veryslow
     """
 
     base, ext = os.path.splitext(os.path.basename(input_file))
@@ -254,7 +353,19 @@ def encode_baseline(input_file: str, output_dir: str | None = None) -> str:
         output
     ]
 
-    run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
+    try:
+        run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
+    except subprocess.CalledProcessError as err:
+        logging.warning("NVENC baseline failed (%s). Falling back to libx264 QP=0.", err)
+        cpu_cmd = base_cmd + [
+            '-c:v', 'libx264',
+            '-preset', 'veryslow',
+            '-qp', '0',
+            '-c:a', 'copy',
+            '-c:s', 'copy',
+            output
+        ]
+        run_ffmpeg_progress(cpu_cmd, total_duration, desc="Baseline Encode (CPU)")
     return output
 
 
@@ -265,6 +376,7 @@ def encode_final(
     raw_fr: float,
     gop: int,
     return_ssim: bool = False,
+    ssim_chunk_seconds: float | None = None,
     output_dir: str | None = None,
     output_base: str | None = None,
     output_ext: str | None = None,
@@ -276,16 +388,23 @@ def encode_final(
     - Uses h264_nvenc -qp {qp} for all baselines (low-res included).
     """
 
-    base_in, ext_in = os.path.splitext(os.path.basename(input_file))
+    base_in, _ = os.path.splitext(os.path.basename(input_file))
     base = output_base or base_in
-    # Normalize container: keep mp4, otherwise mkv (even if caller passed e.g. .avi)
-    ext_hint = output_ext or ext_in
-    ext = ".mp4" if ext_hint.lower() == ".mp4" else ".mkv"
+    # Default to MKV for final optimized output; allow override when explicitly provided.
+    if output_ext:
+        ext = output_ext if output_ext.startswith(".") else f".{output_ext}"
+    else:
+        ext = ".mkv"
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
 
+    # Get resolution label and format framerate
+    resolution = _get_resolution_label(input_file)
+    fps_int = int(round(raw_fr))
+    
     encoder_tag = "h264_nvenc"
-    filename = f"{base} [{encoder_tag} qp {qp}]{ext}"
+    # New format: [codec resolution qp XX].source.ext
+    filename = f"{base} [{encoder_tag} {resolution}{fps_int} qp {qp}].source{ext}"
     output = os.path.join(output_dir, filename) if output_dir else filename
 
     common_opts = [
@@ -317,7 +436,12 @@ def encode_final(
     run_ffmpeg_progress(cmd, total_duration, desc=f"Final File Encode (QP={qp})")
 
     if return_ssim:
-        ssim_val = measure_full_ssim(input_file, output)
+        ssim_val = measure_full_ssim(
+            input_file,
+            output,
+            raw_fr=raw_fr,
+            chunk_seconds=ssim_chunk_seconds,
+        )
         if ssim_val is not None:
             print(f"Full-file SSIM at QP {qp}: {ssim_val:.4f}")
         else:

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-- CLI tool to re-encode videos with NVIDIA NVENC H.264 while hitting a target perceptual quality threshold (currently SSIM; VMAF placeholder).  
+- CLI tool to re-encode videos with NVIDIA NVENC H.264 while hitting a target perceptual quality threshold using SSIM.  
 - Automates sample selection, QP search, and final encode with progress feedback, handling HDR→SDR tonemapping when needed.
 
 ## End-to-End Flow (`ssim_video_optimizer/cli.py`)
@@ -27,7 +27,7 @@
 
 ## Assumptions and Notable Behaviors
 
-- Requires FFmpeg with CUDA/NVENC and `ssim` filter; VMAF path is stubbed even if `libvmaf` exists.  
+- Requires FFmpeg with CUDA/NVENC and `ssim` filter.  
 - All encodes use H.264 NVENC (QP mode, preset p7, `bf=2`); low-res files are still forced through NVENC per current design.  
 - Baseline and final outputs normalize to yuv420p, BT.709, SAR=1; subtitles copied, metadata preserved.  
 - Full-file SSIM logs persist on parse failures to aid debugging; temp files/dirs are otherwise cleaned.  
@@ -51,7 +51,7 @@
 - **Multi-preset runs:** Allow selecting multiple presets in one pass; reuse the same baseline and samples, then emit multiple outputs without re-running sampling/SSIM.
 - **Multi-resolution ladder:** Optional outputs at 480p/720p/1080p/2160p (Plex-style ladder) using the same sampling/SSIM decisions where possible.
 - **Audio/sub handling:** Auto AAC with optional stereo downmix, sensible defaults for subs, and warnings when containers cannot hold certain subtitle types (fallback to mkv when needed).
-- **Quality metrics expansion:** Optional VMAF when available; configurable sample length/count; pluggable metrics while keeping SSIM default.
+- **Quality metrics expansion:** Configurable sample length/count; pluggable metrics while keeping SSIM default.
 - **GUI stack:** PySide6 for a native-feeling cross-platform UI; aligns with Qt docs/examples and works with PyInstaller for Windows bundling.
 
 ## GUI First Mini Action Plan

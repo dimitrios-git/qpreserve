@@ -86,7 +86,12 @@ def run_ffmpeg_progress(cmd: Sequence[Any], total_duration: float, desc: str = "
         bufsize=1
     )
 
-    pbar = tqdm(total=total_duration, desc=desc, unit="s")
+    pbar = tqdm(
+        total=total_duration,
+        desc=desc,
+        unit="s",
+        bar_format="{l_bar}{bar}| {n:.2f}/{total:.2f} {unit}",
+    )
     last_time = 0.0
 
     if process.stdout:
@@ -125,27 +130,40 @@ def run_ffmpeg_progress(cmd: Sequence[Any], total_duration: float, desc: str = "
 # AUDIO STREAM LOGIC
 # ────────────────────────────────────────────────
 
-def build_audio_options(streams: List[Dict[str, Any]]) -> List[str]:
+def build_audio_options(
+    streams: List[Dict[str, Any]],
+    normalize: bool = True,
+    loudnorm_filter: str = "loudnorm=I=-23:TP=-2:LRA=11",
+) -> List[str]:
     """
     Build FFmpeg audio options for all audio streams.
     - If stream is AAC → copy
     - Otherwise → re-encode to AAC at 64 kbps per channel
+    - If normalize is enabled → apply loudnorm and re-encode to AAC
     """
     opts: List[str] = []
     for i, s in enumerate(streams):
         codec = s.get('codec_name', '')
         ch = int(s.get('channels') or 2)
-        if codec != 'aac':
-            bitrate = 64 * ch
+        bitrate = 64 * ch
+        if normalize:
             opts += [
+                f'-filter:a:{i}', loudnorm_filter,
                 f'-c:a:{i}', 'aac',
                 f'-b:a:{i}', f'{bitrate}k',
                 f'-ac:{i}', str(ch)
             ]
         else:
-            opts += [
-                f'-c:a:{i}', 'copy'
-            ]
+            if codec != 'aac':
+                opts += [
+                    f'-c:a:{i}', 'aac',
+                    f'-b:a:{i}', f'{bitrate}k',
+                    f'-ac:{i}', str(ch)
+                ]
+            else:
+                opts += [
+                    f'-c:a:{i}', 'copy'
+                ]
     return opts
 
 
@@ -167,7 +185,7 @@ def setup_logging(verbose: bool, log_file: Optional[str] = None):
 
 
 # ────────────────────────────────────────────────
-# FFMPEG FILTER DETECTION (for libvmaf, ssim, etc.)
+# FFMPEG FILTER DETECTION
 # ────────────────────────────────────────────────
 
 _filter_text_cache: Optional[str] = None
@@ -184,7 +202,7 @@ def _ffmpeg_filters_text() -> str:
 def has_filter(name: str) -> bool:
     """
     Return True if ffmpeg has a filter with `name` in its filter list.
-    This is a simple substring search, good enough for 'ssim', 'libvmaf', etc.
+    This is a simple substring search, good enough for 'ssim', etc.
     """
     text = _ffmpeg_filters_text()
     return name in text

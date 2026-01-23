@@ -32,6 +32,7 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
         return 0.0
 
     # Measure SSIM
+    tqdm.write(f"  Measuring SSIM for sample {os.path.basename(sample_file)} at QP={qp}...")
     def _parse_ssim(text: str) -> float | None:
         for line in text.splitlines():
             if 'All:' in line:
@@ -55,6 +56,7 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
             cmd = ['ffmpeg'] + list(cmd_extra) + cmd[1:]
         
         # Use Popen with communicate() to avoid pipe deadlock on large output
+        process: subprocess.Popen[str] | None = None
         try:
             process = subprocess.Popen(
                 cmd,
@@ -65,7 +67,8 @@ def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, a
             stdout, stderr = process.communicate(timeout=300)  # 5-minute timeout per sample
             res_local = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
         except subprocess.TimeoutExpired:
-            process.kill()
+            if process is not None:
+                process.kill()
             logging.warning("SSIM measurement timed out for %s at QP=%d", sample_file, qp)
             return None, subprocess.CompletedProcess(cmd, 1, "", "Timeout")
         
@@ -145,13 +148,14 @@ def measure_ssim(qp: int, samples: List[str], raw_fr: float, gop: int, audio_opt
         f"avg={results['avg']:.4f} min={results['min']:.4f} max={results['max']:.4f}"
     )
     # If a sample failed (SSIM=0), avoid letting a zero force an overly low QP.
-    if results['min'] == 0.0 and results['max'] > 0.0:
+    EPSILON = 1e-9
+    if abs(results['min']) < EPSILON and results['max'] > EPSILON:
         tqdm.write(f"QP={qp}: min SSIM is 0; using max SSIM ({results['max']:.4f}) for decision.")
         return results['max']
-    if results['max'] == 0.0 and results['min'] > 0.0:
+    if abs(results['max']) < EPSILON and results['min'] > EPSILON:
         tqdm.write(f"QP={qp}: max SSIM is 0; using min SSIM ({results['min']:.4f}) for decision.")
         return results['min']
-    if results['min'] == 0.0 and results['max'] == 0.0:
+    if abs(results['min']) < EPSILON and abs(results['max']) < EPSILON:
         tqdm.write(f"QP={qp}: all sample SSIMs are 0; treating as failure.")
         return 0.0
 

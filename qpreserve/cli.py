@@ -10,6 +10,7 @@ Coordinates:
 """
 
 import argparse
+import sys
 import logging
 import os
 import tempfile
@@ -31,8 +32,36 @@ from .sampling import extract_samples
 from .ssim_search import find_best_qp
 from .encoder import encode_final, encode_baseline
 
+def _print_h264_problems(problems: list[str]) -> None:
+    print("The source video may not be safely encodable with H.264/NVENC:")
+    for problem in problems:
+        print("  ", problem)
+    print()
 
-def _confirm_h264_compat(width: int, height: int, pix_fmt: str) -> bool:
+
+def _resolve_h264_choice(decision: str | None) -> str:
+    if decision in ("abort", "continue"):
+        return "1" if decision == "abort" else "2"
+    if not sys.stdin.isatty():
+        logging.warning(
+            "Non-interactive shell detected; aborting due to H.264 incompatibilities. "
+            "Use --h264-compat continue to override."
+        )
+        return "1"
+    print("Choose an action:")
+    print("  [1] Abort (recommended)")
+    print("  [2] Continue anyway with H.264 (may fail or produce non-standard output)")
+    while True:
+        choice = input("Enter 1 or 2: ").strip()
+        if choice in ('1', '2'):
+            return choice
+
+def _confirm_h264_compat(
+    width: int,
+    height: int,
+    pix_fmt: str,
+    decision: str | None = None,
+) -> bool:
     problems: List[str] = []
 
     # Conservative H.264/NVENC safe bounds
@@ -48,17 +77,8 @@ def _confirm_h264_compat(width: int, height: int, pix_fmt: str) -> bool:
     if not problems:
         return True
 
-    print("The source video may not be safely encodable with H.264/NVENC:")
-    for problem in problems:
-        print("  ", problem)
-    print()
-    print("Choose an action:")
-    print("  [1] Abort (recommended)")
-    print("  [2] Continue anyway with H.264 (may fail or produce non-standard output)")
-    while True:
-        choice = input("Enter 1 or 2: ").strip()
-        if choice in ('1', '2'):
-            break
+    _print_h264_problems(problems)
+    choice = _resolve_h264_choice(decision)
 
     if choice == '1':
         print("Aborting due to incompatible source for H.264/NVENC.")
@@ -218,6 +238,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Skip baseline generation and use source directly. Only recommended for sources '
              'that are already SDR, yuv420p, and BT.709. Ignored for HDR sources.'
+    )
+
+    parser.add_argument(
+        '--h264-compat',
+        choices=['abort', 'continue'],
+        default=None,
+        help='Non-interactive choice when the source may be incompatible with H.264/NVENC (non-TTY defaults to abort).'
     )
 
     parser.add_argument(
@@ -450,7 +477,7 @@ def main():
     # ------------------------------------------------------------
     width, height, pix_fmt = _probe_video_basics(args.input)
 
-    if not _confirm_h264_compat(width, height, pix_fmt):
+    if not _confirm_h264_compat(width, height, pix_fmt, decision=args.h264_compat):
         return
 
     # ------------------------------------------------------------

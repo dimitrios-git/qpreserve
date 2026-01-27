@@ -17,5 +17,11 @@ It samples your video (via scene changes, motion peaks, or uniform intervals), m
 - **Audio passthrough or re-encode**  
   Automatically copies or converts audio streams to AAC at matching bitrates/channels.
 
+- **Optional stereo downmix**  
+  With `--add-stereo-downmix`, adds an AAC stereo downmix for each multichannel audio stream while keeping originals.
+
+- **Audio-only processing (copy video)**  
+  Use `--add-stereo-downmix-copy-video` to skip the SSIM pipeline and only process audio while copying the video stream.
+
 - **Zero-dependency install**  
   Just FFmpeg (with CUDA support) and Python; use `uv` to run and manage the project environment.

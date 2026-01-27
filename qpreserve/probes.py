@@ -34,7 +34,7 @@ def probe_video_duration(input_file: str) -> float:
 def probe_audio_streams(input_file: str) -> List[Dict[str, Any]]:
     res = run_cmd([
         'ffprobe', '-v', 'quiet',
-        '-show_entries', 'stream=index,codec_type,codec_name,channels',
+        '-show_entries', 'stream=index,codec_type,codec_name,channels,channel_layout',
         '-select_streams', 'a',
         '-of', 'json',
         input_file

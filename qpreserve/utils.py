@@ -1,5 +1,7 @@
 # utils.py
 
+from __future__ import annotations
+
 import logging
 import os
 import subprocess
@@ -108,7 +110,7 @@ def _spawn_ffmpeg_progress(
     )
 
 
-def _start_progress_bar(total_duration: float, desc: str) -> tuple[tqdm, float]:
+def _start_progress_bar(total_duration: float, desc: str) -> tuple[tqdm[Any], float]:
     pbar = tqdm(
         total=total_duration,
         desc=desc,
@@ -118,7 +120,7 @@ def _start_progress_bar(total_duration: float, desc: str) -> tuple[tqdm, float]:
     return pbar, 0.0
 
 
-def _consume_progress_output(process: subprocess.Popen[str], pbar: tqdm, last_time: float) -> None:
+def _consume_progress_output(process: subprocess.Popen[str], pbar: tqdm[Any], last_time: float) -> None:
     if process.stdout:
         for line in process.stdout:
             line = line.strip()
@@ -159,6 +161,7 @@ def _finalize_ffmpeg_progress(
 def build_audio_options(
     streams: List[Dict[str, Any]],
     normalize: bool = True,
+    add_stereo_downmix: bool = False,
     loudnorm_filter: str = "loudnorm=I=-23:TP=-2:LRA=11",
 ) -> List[str]:
     """
@@ -166,11 +169,25 @@ def build_audio_options(
     - If stream is AAC → copy
     - Otherwise → re-encode to AAC at 64 kbps per channel
     - If normalize is enabled → apply loudnorm and re-encode to AAC
+    - If add_stereo_downmix is enabled → add a stereo AAC downmix for each
+      multichannel stream (channels > 2), alongside the original stream
     """
-    opts: List[str] = []
+    opts_maps: List[str] = []
+    opts_streams: List[str] = []
     for i, s in enumerate(streams):
-        opts += _audio_opts_for_stream(i, s, normalize, loudnorm_filter)
-    return opts
+        opts_streams += _audio_opts_for_stream(i, s, normalize, loudnorm_filter)
+
+    if add_stereo_downmix:
+        downmix_count = 0
+        for i, s in enumerate(streams):
+            ch = int(s.get('channels') or 2)
+            if ch > 2:
+                opts_maps += ['-map', f'0:a:{i}']
+                out_index = len(streams) + downmix_count
+                opts_streams += _audio_opts_for_downmix(out_index, normalize, loudnorm_filter)
+                downmix_count += 1
+
+    return opts_maps + opts_streams
 
 
 def _audio_opts_for_stream(
@@ -181,25 +198,65 @@ def _audio_opts_for_stream(
 ) -> List[str]:
     codec = stream.get('codec_name', '')
     ch = int(stream.get('channels') or 2)
+    layout = _resolve_channel_layout(stream.get('channel_layout'), ch)
     bitrate = 64 * ch
 
     if normalize:
-        return [
+        opts = [
             f'-filter:a:{index}', loudnorm_filter,
             f'-c:a:{index}', 'aac',
             f'-b:a:{index}', f'{bitrate}k',
             f'-ac:{index}', str(ch)
         ]
+        if layout:
+            opts += [f'-channel_layout:a:{index}', layout]
+        return opts
 
     if codec != 'aac':
-        return [
+        opts = [
             f'-c:a:{index}', 'aac',
             f'-b:a:{index}', f'{bitrate}k',
             f'-ac:{index}', str(ch)
         ]
+        if layout:
+            opts += [f'-channel_layout:a:{index}', layout]
+        return opts
 
     return [f'-c:a:{index}', 'copy']
 
+
+def _audio_opts_for_downmix(
+    index: int,
+    normalize: bool,
+    loudnorm_filter: str,
+) -> List[str]:
+    bitrate = 64 * 2
+    opts: List[str] = []
+    downmix_filter = "aformat=channel_layouts=stereo"
+    if normalize:
+        downmix_filter = f"{loudnorm_filter},{downmix_filter}"
+    opts += [f'-filter:a:{index}', downmix_filter]
+    opts += [
+        f'-c:a:{index}', 'aac',
+        f'-b:a:{index}', f'{bitrate}k',
+        f'-ac:{index}', '2',
+        f'-channel_layout:a:{index}', 'stereo',
+    ]
+    return opts
+
+
+def _resolve_channel_layout(layout: Any, channels: int) -> str | None:
+    if isinstance(layout, str) and layout:
+        return layout
+    if channels == 1:
+        return "mono"
+    if channels == 2:
+        return "stereo"
+    if channels == 6:
+        return "5.1"
+    if channels == 8:
+        return "7.1"
+    return None
 
 # ────────────────────────────────────────────────
 # LOGGING SETUP

@@ -19,12 +19,15 @@ from typing import Any, Dict, List, cast
 
 from .probes import (
     probe_audio_streams,
+    probe_video_duration,
     probe_video_framerate,
     probe_video_stream_info,
     detect_hdr,
 )
 from .utils import (
     build_audio_options,
+    run_cmd,
+    run_ffmpeg_progress,
     setup_logging,
     has_filter,
 )
@@ -228,6 +231,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help='Disable audio loudness normalization (loudnorm).'
     )
     parser.add_argument(
+        '--add-stereo-downmix',
+        action='store_true',
+        help='For each multichannel audio stream, add a stereo AAC downmix alongside the original.'
+    )
+    parser.add_argument(
+        '--add-stereo-downmix-copy-video',
+        action='store_true',
+        help='Copy the video stream and only process audio (normalization/downmix). Implies --add-stereo-downmix.'
+    )
+    parser.add_argument(
         '--full-ssim-chunk-seconds',
         type=float,
         default=300.0,
@@ -266,16 +279,46 @@ def _probe_video_basics(input_path: str) -> tuple[int, int, str]:
 
 
 def _prepare_audio_and_framerate(
-    input_path: str, audio_normalize: bool
+    input_path: str, audio_normalize: bool, add_stereo_downmix: bool
 ) -> tuple[List[str], float, bool]:
     streams: List[Dict[str, Any]] = probe_audio_streams(input_path)
     normalize_enabled = audio_normalize
     if normalize_enabled and not has_filter('loudnorm'):
         print("WARNING: loudnorm filter not available; disabling audio normalization.")
         normalize_enabled = False
-    audio_opts: List[str] = build_audio_options(streams, normalize=normalize_enabled)
+    audio_opts: List[str] = build_audio_options(
+        streams,
+        normalize=normalize_enabled,
+        add_stereo_downmix=add_stereo_downmix,
+    )
     raw_fr: float = probe_video_framerate(input_path)
     return audio_opts, raw_fr, normalize_enabled
+
+
+def _run_audio_only_copy_video(
+    input_path: str,
+    audio_opts: List[str],
+    output_dir: str,
+) -> str:
+    base, ext = os.path.splitext(os.path.basename(input_path))
+    if not ext:
+        ext = ".mkv"
+    output_name = f"{base}.stereo-downmix-added{ext}"
+    output_path = os.path.join(output_dir, output_name)
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', input_path,
+        '-map', '0:v?', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
+    ] + audio_opts + ['-c:v', 'copy', '-c:s', 'copy', output_path]
+
+    duration = probe_video_duration(input_path)
+    if duration > 0:
+        run_ffmpeg_progress(cmd, duration, desc="Audio-only processing")
+    else:
+        run_cmd(cmd)
+
+    return output_path
 
 
 def _calculate_gop(raw_fr: float) -> int:
@@ -473,6 +516,39 @@ def main():
         return
 
     # ------------------------------------------------------------
+    # Audio-only path: copy video, process audio, skip SSIM pipeline
+    # ------------------------------------------------------------
+    if args.add_stereo_downmix_copy_video:
+        args.add_stereo_downmix = True
+        normalize_enabled = args.audio_normalize
+        if normalize_enabled and not has_filter('loudnorm'):
+            print("WARNING: loudnorm filter not available; disabling audio normalization.")
+            normalize_enabled = False
+
+        streams = probe_audio_streams(args.input)
+        audio_opts = build_audio_options(
+            streams,
+            normalize=normalize_enabled,
+            add_stereo_downmix=True,
+        )
+
+        scratch_root = _resolve_scratch_root(args.scratch_dir)
+        tmpdir = tempfile.mkdtemp(prefix="audio_copy_", dir=scratch_root)
+        print(f"Scratch directory: {scratch_root}")
+
+        output_path = _run_audio_only_copy_video(
+            input_path=args.input,
+            audio_opts=audio_opts,
+            output_dir=tmpdir,
+        )
+
+        dest_name = os.path.basename(output_path)
+        dest = os.path.join(os.path.dirname(args.input), dest_name)
+        shutil.move(output_path, dest)
+        print(f"Output file created: {dest}")
+        return
+
+    # ------------------------------------------------------------
     # Probe basic video info (for impossible-encode checks)
     # ------------------------------------------------------------
     width, height, pix_fmt = _probe_video_basics(args.input)
@@ -493,7 +569,7 @@ def main():
     # Probe audio/video from original file
     # ------------------------------------------------------------
     audio_opts, raw_fr, args.audio_normalize = _prepare_audio_and_framerate(
-        args.input, args.audio_normalize
+        args.input, args.audio_normalize, args.add_stereo_downmix
     )
 
     # ------------------------------------------------------------

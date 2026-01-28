@@ -6,7 +6,7 @@ import logging
 import os
 import subprocess
 import tempfile
-from typing import Any, Dict, IO, List, Optional, Sequence
+from typing import Any, Dict, IO, List, Mapping, Optional, Sequence, cast
 
 from tqdm import tqdm
 
@@ -177,6 +177,7 @@ def build_audio_options(
     for i, s in enumerate(streams):
         opts_streams += _audio_opts_for_stream(i, s, normalize, loudnorm_filter)
 
+    downmix_info: List[tuple[int, Optional[str]]] = []
     if add_stereo_downmix:
         downmix_count = 0
         for i, s in enumerate(streams):
@@ -185,9 +186,14 @@ def build_audio_options(
                 opts_maps += ['-map', f'0:a:{i}']
                 out_index = len(streams) + downmix_count
                 opts_streams += _audio_opts_for_downmix(out_index, normalize, loudnorm_filter)
+                language = _stream_language(s)
+                if language:
+                    opts_streams += [f'-metadata:s:a:{out_index}', f'language={language}']
+                downmix_info.append((out_index, language))
                 downmix_count += 1
 
-    return opts_maps + opts_streams
+    dispositions = _audio_default_dispositions(streams, downmix_info)
+    return opts_maps + opts_streams + dispositions
 
 
 def _audio_opts_for_stream(
@@ -257,6 +263,61 @@ def _resolve_channel_layout(layout: Any, channels: int) -> str | None:
     if channels == 8:
         return "7.1"
     return None
+
+
+def _stream_language(stream: Dict[str, Any]) -> Optional[str]:
+    tags = stream.get('tags')
+    if not isinstance(tags, dict):
+        return None
+    tags_map = cast(Mapping[str, Any], tags)
+    language = tags_map.get('language') or tags_map.get('LANGUAGE')
+    if not isinstance(language, str) or not language:
+        return None
+    return language
+
+
+def _is_english_language(language: Optional[str]) -> bool:
+    if not language:
+        return False
+    lang = language.strip().lower()
+    return (
+        lang in {"eng", "en", "english"} or
+        lang.startswith("en-") or
+        lang.startswith("en_")
+    )
+
+
+def _audio_default_dispositions(
+    streams: List[Dict[str, Any]],
+    downmix_info: List[tuple[int, Optional[str]]],
+) -> List[str]:
+    total_audio = len(streams) + len(downmix_info)
+    if total_audio == 0:
+        return []
+
+    candidates: List[tuple[int, Optional[str]]] = []
+    for i, s in enumerate(streams):
+        ch = int(s.get('channels') or 2)
+        if ch == 2:
+            candidates.append((i, _stream_language(s)))
+    candidates.extend(downmix_info)
+
+    if not candidates:
+        return []
+
+    preferred_index: Optional[int] = None
+    for idx, language in candidates:
+        if _is_english_language(language):
+            preferred_index = idx
+            break
+    if preferred_index is None:
+        preferred_index = candidates[0][0]
+
+    opts: List[str] = []
+    for i in range(total_audio):
+        opts += [f'-disposition:a:{i}', '0']
+    opts += [f'-disposition:a:{preferred_index}', 'default']
+    return opts
 
 # ────────────────────────────────────────────────
 # LOGGING SETUP

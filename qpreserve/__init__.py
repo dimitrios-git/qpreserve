@@ -2,7 +2,7 @@
 """
 QPreserve (qpreserve)
 
-A command-line toolkit for optimizing H.264 encoding QP values by targeting
-a user-specified SSIM threshold. Provides sampling strategies (scene, motion,
-uniform), binary search over QP, and a final full-file encode verification.
+A command-line toolkit for optimizing H.264 encoding QP values. Uses SSIM-based
+sampling and full-file verification by default, and switches to size-targeted
+QP selection for modern source codecs (e.g., HEVC/VP9/AV1).
 """

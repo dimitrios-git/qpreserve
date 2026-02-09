@@ -104,3 +104,20 @@ def probe_video_stream_info(input_file: str) -> Dict[str, Any]:
         "height": int(st.get('height', 0) or 0),
         "pix_fmt": st.get('pix_fmt', '')
     }
+
+
+def probe_video_codec(input_file: str) -> str:
+    """
+    Return codec_name of the first video stream (lowercased).
+    """
+    res = run_cmd([
+        'ffprobe', '-v', 'quiet',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_name',
+        '-of', 'json',
+        input_file
+    ], capture_output=True)
+
+    data = json.loads(res.stdout)
+    st = data['streams'][0]
+    return (st.get('codec_name', '') or '').lower()

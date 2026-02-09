@@ -278,3 +278,50 @@ def extract_samples(
         samples.append(sample_file)
 
     return samples, tmpdir
+
+
+def extract_sample_segments(
+    input_file: str,
+    percent: float,
+    count: int,
+    sampling_mode: str = 'uniform',
+    tmp_root: str | None = None,
+) -> tuple[list[str], str, float, float]:
+    """
+    Extract raw sample segments (stream copy) from the given input file.
+    Returns (segments, tmpdir, clip_len, duration).
+    """
+    duration = probe_video_duration(input_file)
+    if duration <= 0:
+        return [], "", 0.0, 0.0
+
+    clip_len = duration * percent / 100.0 / max(count, 1)
+
+    times = select_sample_times(
+        input_file=input_file,
+        percent=percent,
+        count=count,
+        clip_len=clip_len,
+        sampling_mode=sampling_mode
+    )
+
+    if not times:
+        return [], "", 0.0, duration
+
+    tmpdir = tempfile.mkdtemp(prefix="size_sample_", dir=tmp_root)
+    segments: list[str] = []
+    ext = os.path.splitext(input_file)[1]
+
+    for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
+        seg = os.path.join(tmpdir, f"seg_{idx}{ext}")
+        run_cmd([
+            'ffmpeg', '-y',
+            '-ss', str(t),
+            '-i', input_file,
+            '-t', str(clip_len),
+            '-c', 'copy',
+            seg
+        ])
+        segments.append(seg)
+
+    return segments, tmpdir, clip_len, duration

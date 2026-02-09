@@ -323,6 +323,20 @@ def build_hdr_sdr_filter(hdr: Dict[str, Any]) -> str | None:
     return None
 
 
+def _build_bt709_tag_filter() -> str:
+    """
+    Force SDR BT.709 color metadata onto frames so outputs have complete tags.
+    """
+    return "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+
+
+def _merge_filters(*filters: str | None) -> str | None:
+    parts = [f for f in filters if f]
+    if not parts:
+        return None
+    return ",".join(parts)
+
+
 def _is_low_res(path: str) -> bool:
     """
     Decide if a video should be treated as 'low-res' for encoder safety.
@@ -372,12 +386,18 @@ def _get_resolution_label(path: str) -> str:
         return f"{min_dim}p"  # Fallback for unusual resolutions
 
 
-def encode_baseline(input_file: str, output_dir: str | None = None, qp: int = 15) -> str:
+def encode_baseline(
+    input_file: str,
+    output_dir: str | None = None,
+    qp: int = 15,
+    extra_vf: str | None = None,
+) -> str:
     """
     Step 0 + 1: Create the "baseline" file from the ORIGINAL source.
 
     - Detect HDR and apply HDR->SDR tonemapping if needed.
     - Normalize to SDR BT.709, yuv420p, SAR=1.
+    - Optional extra video filter (e.g., crop) before tagging.
     - Attempt H.264 NVENC in constqp mode:
         - QP=baseline
         - preset=p7
@@ -403,7 +423,9 @@ def encode_baseline(input_file: str, output_dir: str | None = None, qp: int = 15
 
     # HDR detection + tonemap
     hdr_info = detect_hdr(input_file)
-    filter_chain = build_hdr_sdr_filter(hdr_info)
+    hdr_filter = build_hdr_sdr_filter(hdr_info)
+    tag_filter = _build_bt709_tag_filter()
+    filter_chain = _merge_filters(hdr_filter, extra_vf, tag_filter)
 
     # Base command: map only v/a/s, ignore data/tmcd/etc.
     base_cmd = [
@@ -416,11 +438,13 @@ def encode_baseline(input_file: str, output_dir: str | None = None, qp: int = 15
     ]
 
     if filter_chain:
-        print("HDR detected → applying HDR→SDR tone mapping")
+        if hdr_info["is_hdr"]:
+            print("HDR detected → applying HDR→SDR tone mapping")
         base_cmd += ['-vf', filter_chain]
 
     base_cmd += [
         '-pix_fmt', 'yuv420p',
+        '-color_range', 'tv',
         '-color_primaries', 'bt709',
         '-color_trc', 'bt709',
         '-colorspace', 'bt709',
@@ -501,8 +525,13 @@ def encode_final(
     encoder_tag = "h264_nvenc"
     # New format: [codec resolution qp XX].source.ext
     filename = f"{base} [{encoder_tag} {resolution}{fps_int} qp {qp}].source{ext}"
-    output = os.path.join(output_dir, filename) if output_dir else filename
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        output = os.path.join(output_dir, filename)
+    else:
+        output = filename
 
+    tag_filter = _build_bt709_tag_filter()
     common_opts = [
         '-map', '0:v',
         '-map', '0:a?',
@@ -511,7 +540,12 @@ def encode_final(
         '-r', str(raw_fr),
         '-g', str(gop),
         '-bf', '2',
+        '-vf', tag_filter,
         '-pix_fmt', 'yuv420p',
+        '-color_range', 'tv',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
+        '-colorspace', 'bt709',
     ]
 
     if low_res:

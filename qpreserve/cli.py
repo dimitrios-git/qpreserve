@@ -15,6 +15,7 @@ import logging
 import os
 import tempfile
 import shutil
+from statistics import mean
 from typing import Any, Dict, List, cast
 
 from .probes import (
@@ -22,6 +23,7 @@ from .probes import (
     probe_video_duration,
     probe_video_framerate,
     probe_video_stream_info,
+    probe_video_codec,
     detect_hdr,
 )
 from .utils import (
@@ -31,8 +33,8 @@ from .utils import (
     setup_logging,
     has_filter,
 )
-from .sampling import extract_samples
-from .ssim_search import find_best_qp
+from .sampling import extract_samples, extract_sample_segments
+from .ssim_search import find_best_qp, measure_ssim
 from .encoder import encode_final, encode_baseline
 
 def _print_h264_problems(problems: list[str]) -> None:
@@ -58,6 +60,20 @@ def _resolve_h264_choice(decision: str | None) -> str:
         choice = input("Enter 1 or 2: ").strip()
         if choice in ('1', '2'):
             return choice
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.abspath(a) == os.path.abspath(b)
+
+def _prompt_use_baseline_as_source() -> bool:
+    if not sys.stdin.isatty():
+        return False
+    choice = input(
+        "Baseline was required. Use baseline as source for labels/output naming? [y/N]: "
+    ).strip().lower()
+    return choice in ("y", "yes")
 
 def _confirm_h264_compat(
     width: int,
@@ -89,6 +105,37 @@ def _confirm_h264_compat(
 
     print("Continuing with H.264/NVENC despite potential incompatibilities...")
     return True
+
+
+def _detect_vertical_overscan_crop(width: int, height: int) -> tuple[int, int] | None:
+    standards = {
+        1280: 720,
+        1920: 1080,
+        2560: 1440,
+        3840: 2160,
+        7680: 4320,
+    }
+    expected = standards.get(width)
+    if expected is None:
+        return None
+    if height <= expected:
+        return None
+    diff = height - expected
+    if diff > 16 or diff % 2 != 0:
+        return None
+    return expected, diff
+
+
+def _prompt_vertical_crop(width: int, height: int, expected: int) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    diff = height - expected
+    crop_each = diff // 2
+    choice = input(
+        f"Detected {width}x{height} (expected {width}x{expected}). "
+        f"Crop {crop_each}px top/bottom to {width}x{expected}? [y/N]: "
+    ).strip().lower()
+    return choice in ("y", "yes")
 
 
 def _resolve_scratch_root(scratch_dir: str | None) -> str:
@@ -154,12 +201,18 @@ def _determine_baseline_file(
     pix_fmt: str,
     baseline_tmp: str,
     baseline_qp: int,
+    extra_vf: str | None = None,
 ) -> str:
     if skip_baseline and _validate_skip_baseline(input_path, pix_fmt):
         print("Skipping baseline generation; using source file directly.")
         return input_path
 
-    baseline_file = encode_baseline(input_path, output_dir=baseline_tmp, qp=baseline_qp)
+    baseline_file = encode_baseline(
+        input_path,
+        output_dir=baseline_tmp,
+        qp=baseline_qp,
+        extra_vf=extra_vf,
+    )
     print(f"Baseline file created: {baseline_file}")
     return baseline_file
 
@@ -173,19 +226,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('input', help='Source video file')
 
     # Quality targets
-    parser.add_argument('--ssim', type=float, default=0.985,
+    parser.add_argument('--ssim', type=float, default=0.986,
                         help='Target SSIM threshold for acceptance.')
 
     # QP search bounds
-    parser.add_argument('--min-qp', type=int, default=23,
+    parser.add_argument('--min-qp', type=int, default=15,
                         help='Minimum QP allowed during search.')
-    parser.add_argument('--max-qp', type=int, default=37,
+    parser.add_argument('--max-qp', type=int, default=40,
                         help='Maximum QP allowed during search.')
 
     # Sampling configuration
     parser.add_argument('--sample-percent', type=float, default=15,
                         help='Percentage of video duration used for sampling.')
-    parser.add_argument('--sample-count', type=int, default=3,
+    parser.add_argument('--sample-count', type=int, default=4,
                         help='How many sample clips to extract.')
     parser.add_argument('--sample-qp', type=int, default=15,
                         help='QP used to encode sample clips.')
@@ -201,6 +254,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default='motion',
         help='Sampling strategy for selecting sample start times.'
     )
+
+    # Size-targeted defaults for modern codecs (HEVC/VP9/AV1)
+    parser.add_argument('--size-delta-hevc', type=float, default=0.50,
+                        help='Target size delta for HEVC/H.265 sources (example: 0.50 = +50 pct).')
+    parser.add_argument('--size-delta-vp9', type=float, default=0.50,
+                        help='Target size delta for VP9 sources (example: 0.50 = +50 pct).')
+    parser.add_argument('--size-delta-av1', type=float, default=0.60,
+                        help='Target size delta for AV1 sources (example: 0.60 = +60 pct).')
+    parser.add_argument('--size-tolerance', type=float, default=0.03,
+                        help='Allowed size error around target (example: 0.03 = +/-3 pct).')
+    parser.add_argument('--h264-compat-ssim', type=float, default=0.996,
+                        help='SSIM target used after size-targeting for modern codecs.')
 
     # SSIM aggregation metric
     parser.add_argument(
@@ -243,7 +308,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--full-ssim-chunk-seconds',
         type=float,
-        default=300.0,
+        default=600.0,
         help='Split full-file SSIM into chunks to reduce RAM use (0 disables).'
     )
     parser.add_argument(
@@ -251,6 +316,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Skip baseline generation and use source directly. Only recommended for sources '
              'that are already SDR, yuv420p, and BT.709. Ignored for HDR sources.'
+    )
+    parser.add_argument(
+        '--use-baseline-as-source',
+        action='store_true',
+        help='Treat the generated baseline as the source reference for labels/output naming.'
     )
 
     parser.add_argument(
@@ -265,6 +335,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=15,
         help='QP used to generate the baseline file.'
+    )
+    parser.add_argument(
+        '--auto-crop',
+        choices=['off', 'prompt', 'force'],
+        default='prompt',
+        help='Detect small vertical overscan (e.g., 1920x1088) and crop to a standard height. '
+             '"prompt" asks when a TTY is available; "force" applies automatically.'
     )
 
     return parser
@@ -321,18 +398,517 @@ def _run_audio_only_copy_video(
     return output_path
 
 
+def _maybe_run_audio_only_path(args: argparse.Namespace) -> bool:
+    if not args.add_stereo_downmix_copy_video:
+        return False
+    args.add_stereo_downmix = True
+    normalize_enabled = args.audio_normalize
+    if normalize_enabled and not has_filter('loudnorm'):
+        print("WARNING: loudnorm filter not available; disabling audio normalization.")
+        normalize_enabled = False
+
+    streams = probe_audio_streams(args.input)
+    audio_opts = build_audio_options(
+        streams,
+        normalize=normalize_enabled,
+        add_stereo_downmix=True,
+    )
+
+    scratch_root = _resolve_scratch_root(args.scratch_dir)
+    tmpdir = tempfile.mkdtemp(prefix="audio_copy_", dir=scratch_root)
+    print(f"Scratch directory: {scratch_root}")
+
+    output_path = _run_audio_only_copy_video(
+        input_path=args.input,
+        audio_opts=audio_opts,
+        output_dir=tmpdir,
+    )
+
+    dest_name = os.path.basename(output_path)
+    dest = os.path.join(os.path.dirname(args.input), dest_name)
+    shutil.move(output_path, dest)
+    print(f"Output file created: {dest}")
+    return True
+
+
 def _calculate_gop(raw_fr: float) -> int:
     return max(1, int(round(raw_fr / 2)))
 
 
-def _select_best_qp(
+def _prompt_initial_qp_rerun(
+    sample_metric: float,
+    full_metric: float,
+    final_qp: int,
+    min_qp: int,
+    max_qp: int,
+    threshold: float,
+) -> int | None:
+    if not sys.stdin.isatty():
+        return None
+    diff = abs(full_metric - sample_metric)
+    if diff < threshold:
+        return None
+    print(
+        "\nNotice: large SSIM gap between samples and full-file result."
+        f"\n  Sample SSIM (QP={final_qp}): {sample_metric:.4f}"
+        f"\n  Full-file SSIM (QP={final_qp}): {full_metric:.4f}"
+        f"\n  Δ={diff:.4f} (threshold {threshold:.4f})"
+    )
+    print(
+        "You can accept the current result, or rerun full-file descent starting at a new QP."
+    )
+    while True:
+        choice = input(
+            f"Enter starting QP [{min_qp}-{max_qp}] to rerun, or press Enter to keep current: "
+        ).strip().lower()
+        if choice == "":
+            return None
+        try:
+            qp_choice = int(choice)
+        except ValueError:
+            print("Please enter a valid QP number.")
+            continue
+        if qp_choice < min_qp:
+            print(f"QP must be >= {min_qp}.")
+            continue
+        return qp_choice
+
+
+def _suggest_qp_from_ssim(ssim_by_qp: Dict[int, tuple[float, str]]) -> tuple[int, float]:
+    avg_ssim = mean(val for val, _ in ssim_by_qp.values())
+    best_qp = min(
+        ssim_by_qp.items(),
+        key=lambda item: (abs(item[1][0] - avg_ssim), -item[0]),
+    )[0]
+    return best_qp, avg_ssim
+
+
+def _prompt_qp_choice(
+    ssim_by_qp: Dict[int, tuple[float, str]],
+    suggested_qp: int,
+    avg_ssim: float,
+    target_ssim: float,
+) -> int:
+    if not sys.stdin.isatty():
+        return suggested_qp
+
+    print(
+        f"\nTarget SSIM {target_ssim:.4f} was not reached. "
+        "Full-file SSIM results by QP:"
+    )
+    for qp in sorted(ssim_by_qp.keys(), reverse=True):
+        ssim_val = ssim_by_qp[qp][0]
+        tag = " (suggested)" if qp == suggested_qp else ""
+        print(f"  QP={qp}: SSIM={ssim_val:.4f}{tag}")
+
+    print(f"Suggested achievable target ~{avg_ssim:.4f} (QP={suggested_qp}).")
+    while True:
+        choice = input("Pick a QP to use (Enter for suggested): ").strip().lower()
+        if choice == "":
+            return suggested_qp
+        try:
+            qp_choice = int(choice)
+        except ValueError:
+            print("Please enter a valid QP number.")
+            continue
+        if qp_choice in ssim_by_qp:
+            return qp_choice
+        print("That QP wasn't measured; choose one from the list above.")
+
+
+def _resolve_source_ref_path(
+    args: argparse.Namespace,
+    baseline_file: str,
+) -> str:
+    skip_baseline_forced_off = args.skip_baseline and not _same_file(baseline_file, args.input)
+    if skip_baseline_forced_off and not args.use_baseline_as_source:
+        if _prompt_use_baseline_as_source():
+            args.use_baseline_as_source = True
+        else:
+            print("Tip: use --use-baseline-as-source to treat the baseline as the source.")
+    return baseline_file if args.use_baseline_as_source else args.input
+
+
+def _prepare_work_dirs(
+    scratch_root: str,
+    input_path: str,
+    skip_baseline: bool,
+) -> tuple[str, str, str | None]:
+    _warn_if_scratch_space_low(scratch_root, input_path, skip_baseline)
+    baseline_tmp = tempfile.mkdtemp(prefix="ssim_baseline_", dir=scratch_root)
+    tmpdir = tempfile.mkdtemp(prefix="ssim_final_", dir=scratch_root)
+    print(f"Scratch directory: {scratch_root}")
+    return baseline_tmp, tmpdir, None
+
+
+def _is_modern_codec(codec: str) -> bool:
+    return codec in {"hevc", "h265", "vp9", "av1"}
+
+
+def _resolve_size_delta(args: argparse.Namespace, codec: str) -> float:
+    if codec in {"hevc", "h265"}:
+        return args.size_delta_hevc
+    if codec == "vp9":
+        return args.size_delta_vp9
+    if codec == "av1":
+        return args.size_delta_av1
+    return 0.0
+
+
+def _estimate_full_size_from_samples(sample_bytes: int, percent: float) -> int:
+    if percent <= 0:
+        return sample_bytes
+    return int(sample_bytes * (100.0 / percent))
+
+
+def _encode_samples_for_qp(
+    segments: list[str],
+    qp: int,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    tmp_root: str,
+) -> int:
+    if not segments:
+        return 0
+
+    tmpdir = tempfile.mkdtemp(prefix=f"size_qp{qp}_", dir=tmp_root)
+    total_bytes = 0
+    try:
+        for idx, seg in enumerate(segments):
+            ext = os.path.splitext(seg)[1]
+            sample_file = os.path.join(tmpdir, f"sample_{idx}{ext}")
+            run_cmd([
+                'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', seg,
+                '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
+                '-r', str(raw_fr), '-g', str(gop),
+                '-bf', '2', '-pix_fmt', 'yuv420p', '-c:v', 'h264_nvenc',
+                '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)
+            ] + audio_opts + ['-c:s', 'copy', sample_file])
+            try:
+                total_bytes += os.path.getsize(sample_file)
+            except OSError:
+                pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return total_bytes
+
+
+def _maybe_use_initial_qp_size(args: argparse.Namespace) -> int | None:
+    if args.initial_qp is None:
+        return None
+    if args.initial_qp < args.min_qp:
+        print(
+            f"WARNING: --initial-qp {args.initial_qp} is below --min-qp {args.min_qp}; "
+            "lowering min-qp to match."
+        )
+        args.min_qp = args.initial_qp
+    if args.initial_qp > args.max_qp:
+        print(
+            f"WARNING: --initial-qp {args.initial_qp} is above --max-qp {args.max_qp}; "
+            "sampling bounds will be ignored."
+        )
+    print(f"Skipping sampling; starting size targeting at QP={args.initial_qp}.")
+    return args.initial_qp
+
+
+def _prepare_size_segments(
+    baseline_file: str,
+    args: argparse.Namespace,
+    scratch_root: str,
+) -> tuple[list[str], str | None]:
+    segments, segments_tmpdir, _, _ = extract_sample_segments(
+        baseline_file,
+        percent=args.sample_percent,
+        count=args.sample_count,
+        sampling_mode=args.sampling_mode,
+        tmp_root=scratch_root,
+    )
+    if not segments_tmpdir:
+        segments_tmpdir = None
+    return segments, segments_tmpdir
+
+
+def _estimate_full_size_for_qp(
+    qp: int,
+    sizes_by_qp: Dict[int, int],
+    segments: list[str],
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    scratch_root: str,
+    sample_percent: float,
+) -> int:
+    if qp in sizes_by_qp:
+        return sizes_by_qp[qp]
+    sample_bytes = _encode_samples_for_qp(
+        segments=segments,
+        qp=qp,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        tmp_root=scratch_root,
+    )
+    est = _estimate_full_size_from_samples(sample_bytes, sample_percent)
+    sizes_by_qp[qp] = est
+    print(f"  Sample size @ QP={qp}: ~{est/1e6:.1f} MB (estimated)")
+    return est
+
+
+def _select_best_qp_size(
     args: argparse.Namespace,
     baseline_file: str,
     audio_opts: List[str],
     raw_fr: float,
     gop: int,
     scratch_root: str,
-) -> tuple[int, str | None]:
+    target_bytes: int,
+    tolerance: float,
+) -> tuple[int, str | None, list[str]]:
+    initial_qp = _maybe_use_initial_qp_size(args)
+    if initial_qp is not None:
+        return initial_qp, None, []
+
+    segments, segments_tmpdir = _prepare_size_segments(
+        baseline_file=baseline_file,
+        args=args,
+        scratch_root=scratch_root,
+    )
+
+    if not segments:
+        print("WARNING: could not extract samples; using min QP.")
+        return args.min_qp, segments_tmpdir, []
+
+    sizes_by_qp: Dict[int, int] = {}
+
+    size_min = _estimate_full_size_for_qp(
+        qp=args.min_qp,
+        sizes_by_qp=sizes_by_qp,
+        segments=segments,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        scratch_root=scratch_root,
+        sample_percent=args.sample_percent,
+    )
+    size_max = _estimate_full_size_for_qp(
+        qp=args.max_qp,
+        sizes_by_qp=sizes_by_qp,
+        segments=segments,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        scratch_root=scratch_root,
+        sample_percent=args.sample_percent,
+    )
+    print(f"Target size: {target_bytes/1e6:.1f} MB")
+
+    if target_bytes >= size_min:
+        return args.min_qp, segments_tmpdir, []
+    if target_bytes <= size_max:
+        return args.max_qp, segments_tmpdir, []
+
+    low, high = args.min_qp, args.max_qp
+    best_qp = low
+    best_diff = abs(size_min - target_bytes)
+
+    while low <= high:
+        mid = (low + high) // 2
+        est = _estimate_full_size_for_qp(
+            qp=mid,
+            sizes_by_qp=sizes_by_qp,
+            segments=segments,
+            audio_opts=audio_opts,
+            raw_fr=raw_fr,
+            gop=gop,
+            scratch_root=scratch_root,
+            sample_percent=args.sample_percent,
+        )
+        diff = abs(est - target_bytes)
+        print(
+            f"  Sample check QP={mid}: est ~{est/1e6:.1f} MB "
+            f"(target {target_bytes/1e6:.1f} MB)"
+        )
+        if diff < best_diff:
+            best_qp = mid
+            best_diff = diff
+        if target_bytes > 0 and (diff / target_bytes) <= tolerance:
+            return mid, segments_tmpdir, []
+        if est > target_bytes:
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    return best_qp, segments_tmpdir, []
+
+
+def _remove_if_not_best(path: str, best_path: str) -> None:
+    if not path or path == best_path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _encode_final_for_size(
+    baseline_file: str,
+    qp: int,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    tmpdir: str,
+    source_base: str,
+    source_ext: str,
+) -> str:
+    return cast(
+        str,
+        encode_final(
+            input_file=baseline_file,
+            qp=qp,
+            audio_opts=audio_opts,
+            raw_fr=raw_fr,
+            gop=gop,
+            return_ssim=False,
+            output_dir=tmpdir,
+            output_base=source_base,
+            output_ext=source_ext,
+        ),
+    )
+
+
+def _safe_file_size(path: str) -> int | None:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def _update_best_size_candidate(
+    output_path: str,
+    current_qp: int,
+    last_size: int,
+    target_bytes: int,
+    best_file: str,
+    best_qp: int,
+    best_diff: float | None,
+) -> tuple[str, int, float]:
+    diff = abs(last_size - target_bytes)
+    if best_diff is None or diff < best_diff:
+        _remove_if_not_best(best_file, output_path)
+        return output_path, current_qp, diff
+    return best_file, best_qp, best_diff
+
+
+def _next_qp_for_size(current_qp: int, last_size: int, target_bytes: int) -> int:
+    if last_size > target_bytes:
+        print("  Result too large → increasing QP")
+        return current_qp + 1
+    print("  Result too small → decreasing QP")
+    return current_qp - 1
+
+
+def _size_search_exhausted(
+    current_qp: int,
+    args: argparse.Namespace,
+    last_size: int,
+    target_bytes: int,
+) -> bool:
+    if target_bytes <= 0:
+        return True
+    if last_size > target_bytes and current_qp < args.min_qp:
+        return True
+    if last_size < target_bytes and current_qp > args.max_qp:
+        return True
+    return False
+
+
+def _run_final_encode_size(
+    args: argparse.Namespace,
+    baseline_file: str,
+    source_ref_path: str,
+    best_qp: int,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    tmpdir: str,
+    target_bytes: int,
+    tolerance: float,
+) -> tuple[str, int, None]:
+    source_base, source_ext = os.path.splitext(os.path.basename(source_ref_path))
+
+    current_qp = best_qp
+    last_file = ""
+    last_size = None
+    last_qp = current_qp
+    best_file = ""
+    best_qp = current_qp
+    best_diff = None
+    seen_qps: set[int] = set()
+
+    while args.min_qp <= current_qp <= args.max_qp:
+        if current_qp in seen_qps:
+            break
+        seen_qps.add(current_qp)
+
+        _remove_if_not_best(last_file, best_file)
+
+        output_path = _encode_final_for_size(
+            baseline_file=baseline_file,
+            qp=current_qp,
+            audio_opts=audio_opts,
+            raw_fr=raw_fr,
+            gop=gop,
+            tmpdir=tmpdir,
+            source_base=source_base,
+            source_ext=source_ext,
+        )
+        last_file = output_path
+        last_qp = current_qp
+        last_size = _safe_file_size(output_path)
+
+        if last_size is not None:
+            print(
+                f"  Full-file size @ QP={current_qp}: {last_size/1e6:.1f} MB "
+                f"(target {target_bytes/1e6:.1f} MB)"
+            )
+
+        if last_size is None or target_bytes <= 0:
+            return output_path, current_qp, None
+
+        best_file, best_qp, best_diff = _update_best_size_candidate(
+            output_path=output_path,
+            current_qp=current_qp,
+            last_size=last_size,
+            target_bytes=target_bytes,
+            best_file=best_file,
+            best_qp=best_qp,
+            best_diff=best_diff,
+        )
+
+        if (best_diff / target_bytes) <= tolerance:
+            return output_path, current_qp, None
+
+        current_qp = _next_qp_for_size(current_qp, last_size, target_bytes)
+
+        if _size_search_exhausted(current_qp, args, last_size, target_bytes):
+            break
+
+    if best_file:
+        return best_file, best_qp, None
+    return last_file, last_qp, None
+
+
+def _select_best_qp(
+    args: argparse.Namespace,
+    baseline_file: str,
+    source_ref_path: str,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    scratch_root: str,
+) -> tuple[int, str | None, list[str]]:
     if args.initial_qp is not None:
         if args.initial_qp < args.min_qp:
             print(
@@ -347,7 +923,7 @@ def _select_best_qp(
             )
         best_qp = args.initial_qp
         print(f"Skipping sampling; starting full-file SSIM descent at QP={best_qp}.")
-        return best_qp, None
+        return best_qp, None, []
 
     samples, samples_tmpdir = extract_samples(
         baseline_file,
@@ -363,10 +939,7 @@ def _select_best_qp(
         samples_tmpdir = None
 
     # NOTE: metric_effective is always 'ssim' for now.
-    try:
-        is_source_ref = os.path.samefile(baseline_file, args.input)
-    except OSError:
-        is_source_ref = baseline_file == args.input
+    is_source_ref = _same_file(baseline_file, source_ref_path)
     ref_label = "source" if is_source_ref else "baseline"
     print(f"Starting sample SSIM checks against {ref_label}...")
     best_qp = find_best_qp(
@@ -379,19 +952,20 @@ def _select_best_qp(
         raw_fr=raw_fr,
         gop=gop
     )
-    return best_qp, samples_tmpdir
+    return best_qp, samples_tmpdir, samples
 
 
 def _run_final_encode(
     args: argparse.Namespace,
     baseline_file: str,
+    source_ref_path: str,
     best_qp: int,
     audio_opts: List[str],
     raw_fr: float,
     gop: int,
     tmpdir: str,
-) -> tuple[str, int]:
-    source_base, source_ext = os.path.splitext(os.path.basename(args.input))
+) -> tuple[str, int, float | None]:
+    source_base, source_ext = os.path.splitext(os.path.basename(source_ref_path))
 
     if args.skip_full_ssim:
         if args.initial_qp is not None:
@@ -411,7 +985,7 @@ def _run_final_encode(
                 output_ext=source_ext,
             ),
         )
-        return final_file, best_qp
+        return final_file, best_qp, None
 
     return _encode_with_full_ssim(
         baseline_file=baseline_file,
@@ -440,15 +1014,11 @@ def _encode_with_full_ssim(
     tmpdir: str,
     source_base: str,
     source_ext: str,
-) -> tuple[str, int]:
-    prev_file: str | None = None
+) -> tuple[str, int, float | None]:
+    ssim_by_qp: Dict[int, tuple[float, str]] = {}
     final_file: str | None = None
     for qp in range(best_qp, min_qp - 1, -1):
         print(f"\nChecking full-file quality at QP={qp}...")
-
-        # Clean up older intermediate file
-        if prev_file and os.path.exists(prev_file):
-            os.remove(prev_file)
 
         # Encode full file (this has its own real FFmpeg progress bar)
         output_path, ssim_val = cast(
@@ -471,21 +1041,49 @@ def _encode_with_full_ssim(
         ssim_val_opt: float | None = ssim_val
         if ssim_val_opt is None:
             logging.warning("Full-file SSIM unavailable at QP=%d; keeping this encode.", qp)
-            return output_path_str, qp
+            return output_path_str, qp, None
 
         print(f"  → SSIM={ssim_val_opt:.4f}")
+        ssim_by_qp[qp] = (ssim_val_opt, output_path_str)
 
         # Round to 4 decimals before comparison to match displayed value
         ssim_rounded = round(ssim_val_opt, 4)
         if ssim_rounded >= target_ssim:
             print(f"  ✓ Meets target SSIM ≥ {target_ssim}; accepting QP={qp}")
-            return output_path_str, qp
+            return output_path_str, qp, ssim_val_opt
 
         print("  ✗ Below target; trying lower QP...")
-        prev_file = output_path_str
+
+    if ssim_by_qp:
+        suggested_qp, avg_ssim = _suggest_qp_from_ssim(ssim_by_qp)
+        if not sys.stdin.isatty():
+            logging.warning(
+                "Could not meet SSIM target; using QP=%d near average SSIM %.4f",
+                suggested_qp,
+                avg_ssim,
+            )
+        chosen_qp = _prompt_qp_choice(ssim_by_qp, suggested_qp, avg_ssim, target_ssim)
+        chosen_file = ssim_by_qp.get(chosen_qp, (None, None))[1]
+        if chosen_file and os.path.exists(chosen_file):
+            return chosen_file, chosen_qp, ssim_by_qp[chosen_qp][0]
+        final_file = cast(
+            str,
+            encode_final(
+                input_file=baseline_file,
+                qp=chosen_qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                return_ssim=False,
+                output_dir=tmpdir,
+                output_base=source_base,
+                output_ext=source_ext,
+            ),
+        )
+        return final_file, chosen_qp, None
 
     logging.warning("Could not meet SSIM target; using sample-based QP=%d", best_qp)
-    final_file = prev_file or cast(
+    final_file = cast(
         str,
         encode_final(
             input_file=baseline_file,
@@ -499,7 +1097,264 @@ def _encode_with_full_ssim(
             output_ext=source_ext,
         ),
     )
-    return final_file, best_qp
+    return final_file, best_qp, None
+
+
+def _resolve_crop_filter(args: argparse.Namespace, width: int, height: int) -> str | None:
+    crop_candidate = _detect_vertical_overscan_crop(width, height)
+    if not crop_candidate:
+        return None
+    expected = crop_candidate[0]
+    apply_crop = False
+    if args.auto_crop == "force":
+        apply_crop = True
+    elif args.auto_crop == "prompt":
+        if sys.stdin.isatty():
+            apply_crop = _prompt_vertical_crop(width, height, expected)
+        else:
+            print(
+                f"Auto-crop candidate detected ({width}x{height} → {width}x{expected}). "
+                "Use --auto-crop force to apply in non-interactive runs."
+            )
+    if not apply_crop:
+        return None
+    crop_filter = f"crop=iw:{expected}:0:(ih-{expected})/2"
+    print(f"Auto-crop enabled: {width}x{height} → {width}x{expected} (centered).")
+    if args.skip_baseline:
+        print("Auto-crop requires baseline generation; disabling --skip-baseline.")
+        args.skip_baseline = False
+    return crop_filter
+
+
+def _resolve_quality_mode(
+    args: argparse.Namespace,
+    input_path: str,
+) -> tuple[str, bool] | None:
+    codec = probe_video_codec(input_path)
+    use_size_target = _is_modern_codec(codec)
+    if use_size_target:
+        delta = _resolve_size_delta(args, codec)
+        print(
+            "Quality metric in use: size target "
+            f"(codec={codec}, delta={delta:.2f}, tolerance={args.size_tolerance:.2%})"
+        )
+        return codec, True
+    if not has_filter('ssim'):
+        print("ERROR: ssim filter not available in ffmpeg. Cannot measure quality.")
+        return None
+    print("Quality metric in use: SSIM")
+    return codec, False
+
+
+def _resolve_target_bytes(
+    args: argparse.Namespace,
+    input_path: str,
+    codec: str,
+) -> int:
+    try:
+        source_size = os.path.getsize(input_path)
+    except OSError:
+        source_size = 0
+    delta = _resolve_size_delta(args, codec)
+    return int(source_size * (1.0 + delta))
+
+
+def _prepare_baseline_and_source(
+    args: argparse.Namespace,
+    use_size_target: bool,
+    crop_filter: str | None,
+    pix_fmt: str,
+    baseline_tmp: str,
+) -> tuple[str, str]:
+    if use_size_target:
+        if crop_filter:
+            baseline_file = _determine_baseline_file(
+                input_path=args.input,
+                skip_baseline=args.skip_baseline,
+                pix_fmt=pix_fmt,
+                baseline_tmp=baseline_tmp,
+                baseline_qp=args.baseline_qp,
+                extra_vf=crop_filter,
+            )
+            source_ref_path = _resolve_source_ref_path(args, baseline_file)
+            return baseline_file, source_ref_path
+        baseline_file = args.input
+        source_ref_path = args.input
+        if not args.skip_baseline:
+            print("Skipping baseline generation for size-targeted path.")
+        return baseline_file, source_ref_path
+
+    baseline_file = _determine_baseline_file(
+        input_path=args.input,
+        skip_baseline=args.skip_baseline,
+        pix_fmt=pix_fmt,
+        baseline_tmp=baseline_tmp,
+        baseline_qp=args.baseline_qp,
+        extra_vf=crop_filter,
+    )
+    source_ref_path = _resolve_source_ref_path(args, baseline_file)
+    return baseline_file, source_ref_path
+
+
+def _select_best_qp_for_size_target(
+    args: argparse.Namespace,
+    baseline_file: str,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    scratch_root: str,
+    target_bytes: int,
+) -> tuple[int, str | None, list[str]]:
+    best_qp, samples_tmpdir, samples = _select_best_qp_size(
+        args=args,
+        baseline_file=baseline_file,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        scratch_root=scratch_root,
+        target_bytes=target_bytes,
+        tolerance=args.size_tolerance,
+    )
+    if samples_tmpdir:
+        shutil.rmtree(samples_tmpdir, ignore_errors=True)
+        samples_tmpdir = None
+    return best_qp, samples_tmpdir, samples
+
+
+def _select_best_qp_for_ssim(
+    args: argparse.Namespace,
+    baseline_file: str,
+    source_ref_path: str,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    scratch_root: str,
+) -> tuple[int, str | None, list[str]]:
+    return _select_best_qp(
+        args=args,
+        baseline_file=baseline_file,
+        source_ref_path=source_ref_path,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        scratch_root=scratch_root,
+    )
+
+
+def _run_size_target_flow(
+    args: argparse.Namespace,
+    baseline_file: str,
+    source_ref_path: str,
+    best_qp: int,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    tmpdir: str,
+    target_bytes: int,
+    baseline_tmp: str,
+    scratch_root: str,
+) -> tuple[str, int, float | None, str | None]:
+    final_file, final_qp, final_full_ssim = _run_final_encode_size(
+        args=args,
+        baseline_file=baseline_file,
+        source_ref_path=source_ref_path,
+        best_qp=best_qp,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        tmpdir=tmpdir,
+        target_bytes=target_bytes,
+        tolerance=args.size_tolerance,
+    )
+    if not has_filter('ssim'):
+        print("WARNING: ssim filter not available; skipping SSIM refinement.")
+        return final_file, final_qp, final_full_ssim, None
+
+    print("\nRefining with SSIM using size-target output as the source...")
+    ssim_input = final_file
+    _, _, ssim_pix_fmt = _probe_video_basics(ssim_input)
+    ssim_baseline = _determine_baseline_file(
+        input_path=ssim_input,
+        skip_baseline=True,
+        pix_fmt=ssim_pix_fmt,
+        baseline_tmp=baseline_tmp,
+        baseline_qp=args.baseline_qp,
+    )
+    original_ssim = args.ssim
+    args.ssim = args.h264_compat_ssim
+    best_qp, samples_tmpdir, _samples = _select_best_qp(
+        args=args,
+        baseline_file=ssim_baseline,
+        source_ref_path=ssim_input,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        scratch_root=scratch_root,
+    )
+    if samples_tmpdir:
+        shutil.rmtree(samples_tmpdir, ignore_errors=True)
+    refine_tmp = tempfile.mkdtemp(prefix="ssim_refine_", dir=scratch_root)
+    final_file, final_qp, final_full_ssim = _run_final_encode(
+        args=args,
+        baseline_file=ssim_baseline,
+        source_ref_path=args.input,
+        best_qp=best_qp,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        tmpdir=refine_tmp,
+    )
+    args.ssim = original_ssim
+    return final_file, final_qp, final_full_ssim, refine_tmp
+
+
+def _maybe_rerun_full_ssim(
+    args: argparse.Namespace,
+    use_size_target: bool,
+    final_full_ssim: float | None,
+    samples: list[str],
+    final_qp: int,
+    baseline_file: str,
+    source_ref_path: str,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    tmpdir: str,
+) -> tuple[str | None, int | None, float | None]:
+    if use_size_target or args.skip_full_ssim or final_full_ssim is None or not samples:
+        return None, None, None
+    sample_metric = measure_ssim(
+        qp=final_qp,
+        samples=samples,
+        raw_fr=raw_fr,
+        gop=gop,
+        audio_opts=audio_opts,
+        metric=args.metric,
+    )
+    discrepancy_threshold = 0.02
+    rerun_qp = _prompt_initial_qp_rerun(
+        sample_metric=sample_metric,
+        full_metric=final_full_ssim,
+        final_qp=final_qp,
+        min_qp=args.min_qp,
+        max_qp=args.max_qp,
+        threshold=discrepancy_threshold,
+    )
+    if rerun_qp is None:
+        return None, None, None
+    return _encode_with_full_ssim(
+        baseline_file=baseline_file,
+        best_qp=rerun_qp,
+        min_qp=args.min_qp,
+        target_ssim=args.ssim,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+        gop=gop,
+        ssim_chunk_seconds=args.full_ssim_chunk_seconds,
+        tmpdir=tmpdir,
+        source_base=os.path.splitext(os.path.basename(source_ref_path))[0],
+        source_ext=os.path.splitext(os.path.basename(source_ref_path))[1],
+    )
 
 
 def main():
@@ -511,6 +1366,10 @@ def main():
     # ------------------------------------------------------------
     setup_logging(args.verbose, args.log_file)
 
+    if args.use_baseline_as_source and args.skip_baseline:
+        print("WARNING: --use-baseline-as-source requires a baseline; ignoring --skip-baseline.")
+        args.skip_baseline = False
+
     if not os.path.isfile(args.input):
         logging.error("Input file not found: %s", args.input)
         return
@@ -518,34 +1377,7 @@ def main():
     # ------------------------------------------------------------
     # Audio-only path: copy video, process audio, skip SSIM pipeline
     # ------------------------------------------------------------
-    if args.add_stereo_downmix_copy_video:
-        args.add_stereo_downmix = True
-        normalize_enabled = args.audio_normalize
-        if normalize_enabled and not has_filter('loudnorm'):
-            print("WARNING: loudnorm filter not available; disabling audio normalization.")
-            normalize_enabled = False
-
-        streams = probe_audio_streams(args.input)
-        audio_opts = build_audio_options(
-            streams,
-            normalize=normalize_enabled,
-            add_stereo_downmix=True,
-        )
-
-        scratch_root = _resolve_scratch_root(args.scratch_dir)
-        tmpdir = tempfile.mkdtemp(prefix="audio_copy_", dir=scratch_root)
-        print(f"Scratch directory: {scratch_root}")
-
-        output_path = _run_audio_only_copy_video(
-            input_path=args.input,
-            audio_opts=audio_opts,
-            output_dir=tmpdir,
-        )
-
-        dest_name = os.path.basename(output_path)
-        dest = os.path.join(os.path.dirname(args.input), dest_name)
-        shutil.move(output_path, dest)
-        print(f"Output file created: {dest}")
+    if _maybe_run_audio_only_path(args):
         return
 
     # ------------------------------------------------------------
@@ -556,14 +1388,15 @@ def main():
     if not _confirm_h264_compat(width, height, pix_fmt, decision=args.h264_compat):
         return
 
-    # ------------------------------------------------------------
-    # Check for SSIM filter availability
-    # ------------------------------------------------------------
-    if not has_filter('ssim'):
-        print("ERROR: ssim filter not available in ffmpeg. Cannot measure quality.")
-        return
+    crop_filter = _resolve_crop_filter(args, width, height)
 
-    print("Quality metric in use: SSIM")
+    # ------------------------------------------------------------
+    # Decide quality metric path (SSIM vs size-target for modern codecs)
+    # ------------------------------------------------------------
+    quality_mode = _resolve_quality_mode(args, args.input)
+    if quality_mode is None:
+        return
+    codec, use_size_target = quality_mode
 
     # ------------------------------------------------------------
     # Probe audio/video from original file
@@ -576,25 +1409,24 @@ def main():
     # Prepare temp directories
     # ------------------------------------------------------------
     scratch_root = _resolve_scratch_root(args.scratch_dir)
-    _warn_if_scratch_space_low(scratch_root, args.input, args.skip_baseline)
-
-    baseline_tmp = tempfile.mkdtemp(prefix="ssim_baseline_", dir=scratch_root)
-    tmpdir = tempfile.mkdtemp(prefix="ssim_final_", dir=scratch_root)
-    print(f"Scratch directory: {scratch_root}")
-    samples_tmpdir: str | None = None
+    baseline_tmp, tmpdir, samples_tmpdir = _prepare_work_dirs(
+        scratch_root, args.input, args.skip_baseline
+    )
+    refine_tmp: str | None = None
 
     try:
         # ------------------------------------------------------------
         # STEP 1 — BASELINE (QP=baseline) ENCODE with PROGRESS (+ optional HDR->SDR)
         # ------------------------------------------------------------
-        # Check if we should skip baseline (only if source meets requirements)
-        baseline_file = _determine_baseline_file(
-            input_path=args.input,
-            skip_baseline=args.skip_baseline,
+        baseline_file, source_ref_path = _prepare_baseline_and_source(
+            args=args,
+            use_size_target=use_size_target,
+            crop_filter=crop_filter,
             pix_fmt=pix_fmt,
             baseline_tmp=baseline_tmp,
-            baseline_qp=args.baseline_qp,
         )
+
+        target_bytes = _resolve_target_bytes(args, args.input, codec) if use_size_target else 0
 
         # ------------------------------------------------------------
         # GOP ~ half framerate
@@ -603,28 +1435,74 @@ def main():
         # ------------------------------------------------------------
         # STEP 2 — SAMPLE CLIP EXTRACTION (optional)
         # ------------------------------------------------------------
-        best_qp, samples_tmpdir = _select_best_qp(
-            args=args,
-            baseline_file=baseline_file,
-            audio_opts=audio_opts,
-            raw_fr=raw_fr,
-            gop=gop,
-            scratch_root=scratch_root,
-        )
+        if use_size_target:
+            best_qp, samples_tmpdir, samples = _select_best_qp_for_size_target(
+                args=args,
+                baseline_file=baseline_file,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                scratch_root=scratch_root,
+                target_bytes=target_bytes,
+            )
+        else:
+            best_qp, samples_tmpdir, samples = _select_best_qp_for_ssim(
+                args=args,
+                baseline_file=baseline_file,
+                source_ref_path=source_ref_path,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                scratch_root=scratch_root,
+            )
 
         # ------------------------------------------------------------
         # STEP 4 — FULL-FILE FINAL ENCODE DESCENT (CLEANER OUTPUT)
         # ------------------------------------------------------------
 
-        final_file, final_qp = _run_final_encode(
+        if use_size_target:
+            final_file, final_qp, final_full_ssim, refine_tmp = _run_size_target_flow(
+                args=args,
+                baseline_file=baseline_file,
+                source_ref_path=source_ref_path,
+                best_qp=best_qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                tmpdir=tmpdir,
+                target_bytes=target_bytes,
+                baseline_tmp=baseline_tmp,
+                scratch_root=scratch_root,
+            )
+        else:
+            final_file, final_qp, final_full_ssim = _run_final_encode(
+                args=args,
+                baseline_file=baseline_file,
+                source_ref_path=source_ref_path,
+                best_qp=best_qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                tmpdir=tmpdir,
+            )
+
+        rerun_file, rerun_qp, rerun_ssim = _maybe_rerun_full_ssim(
             args=args,
+            use_size_target=use_size_target,
+            final_full_ssim=final_full_ssim,
+            samples=samples,
+            final_qp=final_qp,
             baseline_file=baseline_file,
-            best_qp=best_qp,
+            source_ref_path=source_ref_path,
             audio_opts=audio_opts,
             raw_fr=raw_fr,
             gop=gop,
             tmpdir=tmpdir,
         )
+        if rerun_file is not None and rerun_qp is not None:
+            final_file = rerun_file
+            final_qp = rerun_qp
+            final_full_ssim = rerun_ssim
 
         # ------------------------------------------------------------
         # STEP 5 — MOVE FINAL RESULT TO SOURCE DIRECTORY
@@ -642,6 +1520,8 @@ def main():
             shutil.rmtree(samples_tmpdir, ignore_errors=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
         shutil.rmtree(baseline_tmp, ignore_errors=True)
+        if refine_tmp:
+            shutil.rmtree(refine_tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -131,6 +131,28 @@ def _consume_progress_output(process: subprocess.Popen[str], pbar: tqdm[Any], la
                 if sec > last_time:
                     pbar.update(sec - last_time)
                     last_time = sec
+            elif line.startswith("out_time_us="):
+                # Some FFmpeg builds report progress primarily via out_time_us.
+                raw = line.split("=", 1)[1]
+                try:
+                    sec = int(raw) / 1_000_000.0
+                except ValueError:
+                    sec = 0.0
+                if sec > last_time:
+                    pbar.update(sec - last_time)
+                    last_time = sec
+            elif line.startswith("out_time_ms="):
+                # Keep compatibility with builds that emit out_time_ms.
+                raw = line.split("=", 1)[1]
+                try:
+                    val = int(raw)
+                except ValueError:
+                    val = 0
+                # FFmpeg has historically used microseconds in this field.
+                sec = val / 1_000_000.0
+                if sec > last_time:
+                    pbar.update(sec - last_time)
+                    last_time = sec
 
             elif line == "progress=end":
                 break
@@ -212,7 +234,8 @@ def _audio_opts_for_stream(
             f'-filter:a:{index}', loudnorm_filter,
             f'-c:a:{index}', 'aac',
             f'-b:a:{index}', f'{bitrate}k',
-            f'-ac:{index}', str(ch)
+            f'-ac:{index}', str(ch),
+            f'-ar:a:{index}', '48000',
         ]
         if layout:
             opts += [f'-channel_layout:a:{index}', layout]
@@ -222,7 +245,8 @@ def _audio_opts_for_stream(
         opts = [
             f'-c:a:{index}', 'aac',
             f'-b:a:{index}', f'{bitrate}k',
-            f'-ac:{index}', str(ch)
+            f'-ac:{index}', str(ch),
+            f'-ar:a:{index}', '48000',
         ]
         if layout:
             opts += [f'-channel_layout:a:{index}', layout]
@@ -246,6 +270,7 @@ def _audio_opts_for_downmix(
         f'-c:a:{index}', 'aac',
         f'-b:a:{index}', f'{bitrate}k',
         f'-ac:{index}', '2',
+        f'-ar:a:{index}', '48000',
         f'-channel_layout:a:{index}', 'stereo',
     ]
     return opts

@@ -13,6 +13,56 @@ from .probes import (
     probe_video_stream_info,
 )
 
+def _normalize_video_codec(video_codec: str) -> str:
+    codec = (video_codec or "h264").lower()
+    if codec == "hevc":
+        return "h265"
+    return codec
+
+
+def _nvenc_encoder_for(video_codec: str) -> str:
+    codec = _normalize_video_codec(video_codec)
+    return "hevc_nvenc" if codec == "h265" else "h264_nvenc"
+
+
+def _cpu_encoder_for(video_codec: str) -> str:
+    codec = _normalize_video_codec(video_codec)
+    return "libx265" if codec == "h265" else "libx264"
+
+
+def _is_10bit_pix_fmt(pix_fmt: str) -> bool:
+    p = (pix_fmt or "").lower()
+    return "10" in p or "p010" in p
+
+
+def _build_source_color_args(hdr_info: Dict[str, Any]) -> list[str]:
+    prim = str(hdr_info.get("primaries") or "").lower()
+    tr = str(hdr_info.get("transfer") or "").lower()
+    mat = str(hdr_info.get("matrix") or "").lower()
+
+    tr_aliases = {
+        "bt470bg": "gamma28",
+        "bt470m": "gamma22",
+        "bt601": "smpte170m",
+        "unknown": "",
+        "unspecified": "",
+    }
+    tr = tr_aliases.get(tr, tr)
+
+    if not prim:
+        prim = "bt2020" if hdr_info.get("is_hdr") else "bt709"
+    if not tr:
+        tr = "smpte2084" if hdr_info.get("is_hdr") else "bt709"
+    if not mat:
+        mat = "bt2020nc" if hdr_info.get("is_hdr") else "bt709"
+
+    return [
+        "-color_range", "tv",
+        "-color_primaries", prim,
+        "-color_trc", tr,
+        "-colorspace", mat,
+    ]
+
 
 def _build_ssim_filter_chain(raw_fr: float | None) -> str:
     # Normalize timestamps (and optionally FPS) to avoid large frame sync buffers
@@ -391,6 +441,7 @@ def encode_baseline(
     output_dir: str | None = None,
     qp: int = 15,
     extra_vf: str | None = None,
+    video_codec: str = "h264",
 ) -> str:
     """
     Step 0 + 1: Create the "baseline" file from the ORIGINAL source.
@@ -416,16 +467,32 @@ def encode_baseline(
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
 
+    codec_norm = _normalize_video_codec(video_codec)
+    nvenc_encoder = _nvenc_encoder_for(codec_norm)
+    cpu_encoder = _cpu_encoder_for(codec_norm)
     if low_res:
-        logging.info("Low-resolution source detected → baseline via h264_nvenc (QP=%d).", qp)
+        logging.info("Low-resolution source detected → baseline via %s (QP=%d).", nvenc_encoder, qp)
     else:
-        logging.info("High-resolution source → baseline via h264_nvenc (QP=%d).", qp)
+        logging.info("High-resolution source → baseline via %s (QP=%d).", nvenc_encoder, qp)
 
-    # HDR detection + tonemap
     hdr_info = detect_hdr(input_file)
-    hdr_filter = build_hdr_sdr_filter(hdr_info)
-    tag_filter = _build_bt709_tag_filter()
-    filter_chain = _merge_filters(hdr_filter, extra_vf, tag_filter)
+    source_vinfo = probe_video_stream_info(input_file)
+    source_pix_fmt = str(source_vinfo.get("pix_fmt", "") or "")
+    if codec_norm == "h264":
+        hdr_filter = build_hdr_sdr_filter(hdr_info)
+        tag_filter = _build_bt709_tag_filter()
+        filter_chain = _merge_filters(hdr_filter, extra_vf, tag_filter)
+        format_args = [
+            '-pix_fmt', 'yuv420p',
+            '-color_range', 'tv',
+            '-color_primaries', 'bt709',
+            '-color_trc', 'bt709',
+            '-colorspace', 'bt709',
+        ]
+    else:
+        filter_chain = extra_vf
+        pix_fmt = 'p010le' if _is_10bit_pix_fmt(source_pix_fmt) else 'yuv420p'
+        format_args = ['-pix_fmt', pix_fmt] + _build_source_color_args(hdr_info)
 
     # Base command: map only v/a/s, ignore data/tmcd/etc.
     base_cmd = [
@@ -442,16 +509,10 @@ def encode_baseline(
             print("HDR detected → applying HDR→SDR tone mapping")
         base_cmd += ['-vf', filter_chain]
 
-    base_cmd += [
-        '-pix_fmt', 'yuv420p',
-        '-color_range', 'tv',
-        '-color_primaries', 'bt709',
-        '-color_trc', 'bt709',
-        '-colorspace', 'bt709',
-    ]
+    base_cmd += format_args
 
     nvenc_opts = [
-        '-c:v', 'h264_nvenc',
+        '-c:v', nvenc_encoder,
         '-preset', 'p7',
         '-rc', 'constqp',
         '-qp', str(qp),
@@ -469,9 +530,9 @@ def encode_baseline(
     try:
         run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
     except subprocess.CalledProcessError as err:
-        logging.warning("NVENC baseline failed (%s). Falling back to libx264 baseline QP.", err)
+        logging.warning("NVENC baseline failed (%s). Falling back to %s baseline QP.", err, cpu_encoder)
         cpu_cmd = base_cmd + [
-            '-c:v', 'libx264',
+            '-c:v', cpu_encoder,
             '-preset', 'veryslow',
             '-qp', str(qp),
             '-c:a', 'copy',
@@ -488,6 +549,7 @@ def encode_final(
     audio_opts: list[str],
     raw_fr: float,
     gop: int,
+    video_codec: str = "h264",
     return_ssim: bool = False,
     ssim_chunk_seconds: float | None = None,
     output_dir: str | None = None,
@@ -498,7 +560,7 @@ def encode_final(
     Final encode (from the baseline file), with FFmpeg progress and optional SSIM.
 
     - input_file here is the BASELINE file (already normalized to SDR, bt709).
-    - Uses h264_nvenc -qp {qp} for all baselines (low-res included).
+    - Uses selected NVENC codec -qp {qp} for all baselines.
     """
 
     base_in, _ = os.path.splitext(os.path.basename(input_file))
@@ -517,12 +579,17 @@ def encode_final(
         ext = ".mkv"
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
+    codec_norm = _normalize_video_codec(video_codec)
+    nvenc_encoder = _nvenc_encoder_for(codec_norm)
+    hdr_info = detect_hdr(input_file)
+    source_vinfo = probe_video_stream_info(input_file)
+    source_pix_fmt = str(source_vinfo.get("pix_fmt", "") or "")
 
     # Get resolution label and format framerate
     resolution = _get_resolution_label(input_file)
     fps_int = int(round(raw_fr))
     
-    encoder_tag = "h264_nvenc"
+    encoder_tag = nvenc_encoder
     # New format: [codec resolution qp XX].source.ext
     filename = f"{base} [{encoder_tag} {resolution}{fps_int} qp {qp}].source{ext}"
     if output_dir:
@@ -531,7 +598,21 @@ def encode_final(
     else:
         output = filename
 
-    tag_filter = _build_bt709_tag_filter()
+    vf_opts: list[str] = []
+    color_opts: list[str] = []
+    pix_fmt = "yuv420p"
+    if codec_norm == "h264":
+        vf_opts = ['-vf', _build_bt709_tag_filter()]
+        color_opts = [
+            '-color_range', 'tv',
+            '-color_primaries', 'bt709',
+            '-color_trc', 'bt709',
+            '-colorspace', 'bt709',
+        ]
+    else:
+        pix_fmt = 'p010le' if _is_10bit_pix_fmt(source_pix_fmt) else 'yuv420p'
+        color_opts = _build_source_color_args(hdr_info)
+
     common_opts = [
         '-map', '0:v',
         '-map', '0:a?',
@@ -540,25 +621,19 @@ def encode_final(
         '-r', str(raw_fr),
         '-g', str(gop),
         '-bf', '2',
-        '-vf', tag_filter,
-        '-pix_fmt', 'yuv420p',
-        '-color_range', 'tv',
-        '-color_primaries', 'bt709',
-        '-color_trc', 'bt709',
-        '-colorspace', 'bt709',
-    ]
+    ] + vf_opts + ['-pix_fmt', pix_fmt] + color_opts
 
     if low_res:
-        logging.info("Low-resolution baseline → final encode via h264_nvenc (QP=%d).", qp)
+        logging.info("Low-resolution baseline → final encode via %s (QP=%d).", nvenc_encoder, qp)
     else:
-        logging.info("High-resolution baseline → final encode via h264_nvenc (QP=%d).", qp)
+        logging.info("High-resolution baseline → final encode via %s (QP=%d).", nvenc_encoder, qp)
 
     cmd = [
         'ffmpeg', '-y',
         '-hwaccel', 'cuda',
         '-i', input_file,
     ] + common_opts + [
-        '-c:v', 'h264_nvenc',
+        '-c:v', nvenc_encoder,
         '-preset', 'p7',
         '-rc', 'constqp',
         '-qp', str(qp),

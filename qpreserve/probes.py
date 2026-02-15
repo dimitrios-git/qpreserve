@@ -121,3 +121,29 @@ def probe_video_codec(input_file: str) -> str:
     data = json.loads(res.stdout)
     st = data['streams'][0]
     return (st.get('codec_name', '') or '').lower()
+
+
+def probe_video_bitrate(input_file: str) -> int | None:
+    """
+    Return bit_rate (bps) of the first video stream if available.
+    """
+    res = run_cmd([
+        'ffprobe', '-v', 'quiet',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=bit_rate',
+        '-of', 'json',
+        input_file
+    ], capture_output=True)
+
+    data = json.loads(res.stdout)
+    streams = data.get('streams') or []
+    if not streams:
+        return None
+    val = streams[0].get('bit_rate')
+    if val in (None, "", "N/A"):
+        return None
+    try:
+        bit_rate = int(val)
+    except (TypeError, ValueError):
+        return None
+    return bit_rate if bit_rate > 0 else None

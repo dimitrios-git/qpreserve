@@ -10,12 +10,34 @@ from .utils import run_cmd
 from tqdm import tqdm
 
 
-def measure_ssim_on_sample(sample_file: str, qp: int, raw_fr: float, gop: int, audio_opts: List[str]) -> float:
+def _normalize_video_codec(video_codec: str) -> str:
+    codec = (video_codec or "h264").lower()
+    if codec == "hevc":
+        return "h265"
+    return codec
+
+
+def _nvenc_encoder_for(video_codec: str) -> str:
+    return "hevc_nvenc" if _normalize_video_codec(video_codec) == "h265" else "h264_nvenc"
+
+
+def _nvenc_pix_fmt_for(video_codec: str) -> str:
+    return "p010le" if _normalize_video_codec(video_codec) == "h265" else "yuv420p"
+
+
+def measure_ssim_on_sample(
+    sample_file: str,
+    qp: int,
+    raw_fr: float,
+    gop: int,
+    audio_opts: List[str],
+    video_codec: str = "h264",
+) -> float:
     """
     Re-encode a sample at the given QP (with the proper GOP) and measure SSIM against the original.
     """
     temp_out = _sample_encoded_path(sample_file)
-    if not _encode_sample(sample_file, temp_out, qp, raw_fr, gop, audio_opts):
+    if not _encode_sample(sample_file, temp_out, qp, raw_fr, gop, audio_opts, video_codec):
         return 0.0
 
     tqdm.write(f"  Measuring SSIM for sample {os.path.basename(sample_file)} at QP={qp}...")
@@ -43,13 +65,16 @@ def _encode_sample(
     raw_fr: float,
     gop: int,
     audio_opts: List[str],
+    video_codec: str = "h264",
 ) -> bool:
+    nvenc_encoder = _nvenc_encoder_for(video_codec)
+    pix_fmt = _nvenc_pix_fmt_for(video_codec)
     try:
         run_cmd([
             'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', sample_file,
             '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
-            '-r', str(raw_fr), '-g', str(gop), '-bf', '2', '-pix_fmt', 'yuv420p',
-            '-c:v', 'h264_nvenc', '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)
+            '-r', str(raw_fr), '-g', str(gop), '-bf', '2', '-pix_fmt', pix_fmt,
+            '-c:v', nvenc_encoder, '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)
         ] + audio_opts + ['-c:s', 'copy', temp_out])
     except Exception as e:
         logging.warning(
@@ -159,14 +184,22 @@ def _persist_ssim_logs(
     )
 
 
-def measure_ssim(qp: int, samples: List[str], raw_fr: float, gop: int, audio_opts: List[str], metric: str) -> float:
+def measure_ssim(
+    qp: int,
+    samples: List[str],
+    raw_fr: float,
+    gop: int,
+    audio_opts: List[str],
+    metric: str,
+    video_codec: str = "h264",
+) -> float:
     """
     Compute the chosen SSIM metric (avg/min/max) across all sample clips at a given QP.
     """
     vals: List[float] = []
     pbar = tqdm(samples, desc=f"SSIM@QP{qp}", leave=False)
     for s in pbar:
-        vals.append(measure_ssim_on_sample(s, qp, raw_fr, gop, audio_opts))
+        vals.append(measure_ssim_on_sample(s, qp, raw_fr, gop, audio_opts, video_codec))
     pbar.close()
 
     results: dict[str, float] = {'avg': mean(vals), 'min': min(vals), 'max': max(vals)}
@@ -189,22 +222,35 @@ def measure_ssim(qp: int, samples: List[str], raw_fr: float, gop: int, audio_opt
     return results[metric]
 
 
-def find_best_qp(samples: List[str], min_qp: int, max_qp: int, target_ssim: float,
-                metric: str, audio_opts: List[str], raw_fr: float, gop: int) -> int:
+def find_best_qp(
+    samples: List[str],
+    min_qp: int,
+    max_qp: int,
+    target_ssim: float,
+    metric: str,
+    audio_opts: List[str],
+    raw_fr: float,
+    gop: int,
+    video_codec: str = "h264",
+) -> int:
     """
     Binary search for the lowest QP between min_qp and max_qp where sample-based SSIM >= target_ssim.
     """
     low, high = min_qp, max_qp
 
     # Decide starting best based on high-QP SSIM
-    best = high if measure_ssim(high, samples, raw_fr, gop, audio_opts, metric) >= target_ssim else low
+    best = (
+        high
+        if measure_ssim(high, samples, raw_fr, gop, audio_opts, metric, video_codec) >= target_ssim
+        else low
+    )
 
     pbar = tqdm(desc="QP Binary Search", unit="step")
 
     while high - low > 1:
         pbar.update(1)
         mid = (low + high) // 2
-        if measure_ssim(mid, samples, raw_fr, gop, audio_opts, metric) >= target_ssim:
+        if measure_ssim(mid, samples, raw_fr, gop, audio_opts, metric, video_codec) >= target_ssim:
             best, low = mid, mid
         else:
             high = mid

@@ -9,6 +9,20 @@ from .utils import run_cmd
 
 from tqdm import tqdm
 
+def _normalize_video_codec(video_codec: str) -> str:
+    codec = (video_codec or "h264").lower()
+    if codec == "hevc":
+        return "h265"
+    return codec
+
+
+def _nvenc_encoder_for(video_codec: str) -> str:
+    return "hevc_nvenc" if _normalize_video_codec(video_codec) == "h265" else "h264_nvenc"
+
+
+def _nvenc_pix_fmt_for(video_codec: str) -> str:
+    return "p010le" if _normalize_video_codec(video_codec) == "h265" else "yuv420p"
+
 
 def make_safe_symlink(input_file: str) -> str:
     """
@@ -224,6 +238,7 @@ def extract_samples(
     sample_qp: int,
     audio_opts: list[str],
     raw_fr: float,
+    video_codec: str = "h264",
     sampling_mode: str = 'uniform',
     tmp_root: str | None = None,
 ) -> tuple[list[str], str]:
@@ -250,6 +265,8 @@ def extract_samples(
 
     tmpdir = tempfile.mkdtemp(prefix="ssim_sample_", dir=tmp_root)
     samples: list[str] = []
+    nvenc_encoder = _nvenc_encoder_for(video_codec)
+    pix_fmt = _nvenc_pix_fmt_for(video_codec)
 
     for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
         ext = os.path.splitext(input_file)[1]
@@ -271,7 +288,7 @@ def extract_samples(
             'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', seg,
             '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
             '-r', str(raw_fr), '-g', str(int(max(1, round(raw_fr / 2)))),
-            '-bf', '2', '-pix_fmt', 'yuv420p', '-c:v', 'h264_nvenc',
+            '-bf', '2', '-pix_fmt', pix_fmt, '-c:v', nvenc_encoder,
             '-preset', 'p7', '-rc', 'constqp', '-qp', str(sample_qp)
         ] + audio_opts + ['-c:s', 'copy', sample_file])
 

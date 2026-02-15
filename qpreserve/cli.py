@@ -1256,7 +1256,7 @@ def _tier_for_bppf(codec: str, bppf: float) -> str:
     if c == "h265":
         if bppf >= 0.120:
             return "ultra"
-        if bppf >= 0.070:
+        if bppf >= 0.060:
             return "high"
         if bppf >= 0.024:
             return "medium"

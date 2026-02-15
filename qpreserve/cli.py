@@ -15,7 +15,7 @@ import logging
 import os
 import tempfile
 import shutil
-from statistics import mean
+from statistics import mean, median
 from typing import Any, Dict, List, cast
 
 from .probes import (
@@ -281,7 +281,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='Target SSIM threshold for acceptance.')
 
     # QP search bounds
-    parser.add_argument('--min-qp', type=int, default=13,
+    parser.add_argument('--min-qp', type=int, default=6,
                         help='Minimum QP allowed during search.')
     parser.add_argument('--max-qp', type=int, default=40,
                         help='Maximum QP allowed during search.')
@@ -289,9 +289,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # Sampling configuration
     parser.add_argument('--sample-percent', type=float, default=15,
                         help='Percentage of video duration used for sampling.')
-    parser.add_argument('--sample-count', type=int, default=4,
+    parser.add_argument('--sample-count', type=int, default=3,
                         help='How many sample clips to extract.')
-    parser.add_argument('--sample-qp', type=int, default=13,
+    parser.add_argument('--sample-qp', type=int, default=6,
                         help='QP used to encode sample clips.')
     parser.add_argument(
         '--initial-qp',
@@ -428,7 +428,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--baseline-qp',
         type=int,
-        default=13,
+        default=6,
         help='QP used to generate the baseline file.'
     )
     parser.add_argument(
@@ -1474,8 +1474,8 @@ def _quality_label_to_qp(label: str) -> int | None:
     key = label.strip().lower().replace("_", "-").replace(" ", "-")
     mapping = {
         # Canonical tiers
-        "ultra": 13,
-        "high": 17,
+        "ultra": 9,
+        "high": 13,
         "medium": 21,
         "low": 25,
     }
@@ -1563,11 +1563,16 @@ def _suggest_expected_qps(
     min_gain_pct: float,
     knee_ratio: float,
 ) -> tuple[int, int]:
+    flat_drop_per_100mb_threshold = 0.00008
+    flat_cumulative_drop_threshold = 0.0008
+    flat_min_total_saved_pct = 20.0
+
     if len(rows) <= 1:
         qp = rows[0]["qp"]
         return qp, qp
 
     transitions: list[tuple[int, float, float]] = []
+    drop_per_100mb_values: list[float] = []
     for i in range(1, len(rows)):
         prev = rows[i - 1]
         cur = rows[i]
@@ -1575,6 +1580,27 @@ def _suggest_expected_qps(
         size_saved_pct = _safe_pct_delta(prev["size_bytes"], cur["size_bytes"])
         velocity = _transition_velocity(prev["ssim"], cur["ssim"], size_saved_mb)
         transitions.append((i, size_saved_pct, velocity))
+        if size_saved_mb > 0:
+            drop_per_100mb_values.append(velocity)
+
+    total_saved_pct = _safe_pct_delta(rows[0]["size_bytes"], rows[-1]["size_bytes"])
+    cumulative_drop = sum(max(0.0, rows[i - 1]["ssim"] - rows[i]["ssim"]) for i in range(1, len(rows)))
+    median_drop_per_100mb = median(drop_per_100mb_values) if drop_per_100mb_values else 0.0
+    flat_ladder = (
+        total_saved_pct >= flat_min_total_saved_pct
+        and cumulative_drop <= flat_cumulative_drop_threshold
+        and median_drop_per_100mb <= flat_drop_per_100mb_threshold
+    )
+    if flat_ladder:
+        safe_qp = rows[-2]["qp"]
+        balanced_qp = rows[-1]["qp"]
+        print(
+            "Expected-QP: flat SSIM/size ladder detected "
+            f"(total_saved={total_saved_pct:.2f}%, cumulative_drop={cumulative_drop:.6f}, "
+            f"median_drop_per_100mb={median_drop_per_100mb:.6f}); "
+            f"preferring higher-QP tail ({safe_qp}/{balanced_qp})."
+        )
+        return safe_qp, balanced_qp
 
     valid = [t for t in transitions if t[1] >= min_gain_pct]
     if not valid:

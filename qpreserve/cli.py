@@ -229,48 +229,27 @@ def _warn_if_scratch_space_low(
         pass
 
 
-def _validate_skip_baseline(input_path: str, pix_fmt: str) -> bool:
-    hdr_info: Dict[str, Any] = detect_hdr(input_path)
-    warnings: List[str] = []
-
-    # Check HDR
-    if hdr_info["is_hdr"]:
-        warnings.append("HDR detected (requires HDR→SDR tonemapping)")
-
-    # Check color space
-    if hdr_info["primaries"] and hdr_info["primaries"] != "bt709":
-        warnings.append(f"Color primaries: {hdr_info['primaries']} (expected bt709)")
-    if hdr_info["transfer"] and hdr_info["transfer"] != "bt709":
-        warnings.append(f"Color transfer: {hdr_info['transfer']} (expected bt709)")
-    if hdr_info["matrix"] and hdr_info["matrix"] != "bt709":
-        warnings.append(f"Color space: {hdr_info['matrix']} (expected bt709)")
-
-    # Check pixel format
-    if pix_fmt != "yuv420p":
-        warnings.append(f"Pixel format: {pix_fmt} (expected yuv420p)")
-
-    if not warnings:
-        return True
-
-    print("WARNING: --skip-baseline ignored due to source incompatibilities:")
-    for warning in warnings:
-        print(f"  - {warning}")
-    print("Baseline generation required for normalization.")
-    return False
-
-
 def _determine_baseline_file(
     input_path: str,
     skip_baseline: bool,
-    pix_fmt: str,
     baseline_tmp: str,
     baseline_qp: int,
     extra_vf: str | None = None,
     video_codec: str = "h264",
 ) -> str:
-    if skip_baseline and _validate_skip_baseline(input_path, pix_fmt):
-        print("Skipping baseline generation; using source file directly.")
-        return input_path
+    if skip_baseline:
+        if extra_vf:
+            print("Auto-crop requires baseline generation; disabling --skip-baseline.")
+            skip_baseline = False
+        if skip_baseline:
+            src_codec = _normalize_video_codec(probe_video_codec(input_path))
+            if src_codec == "h265":
+                print("Skipping baseline generation; source codec is h265/hevc.")
+                return input_path
+            print(
+                f"--skip-baseline ignored: source codec is '{src_codec}'. "
+                "Baseline generation is required for non-h265 sources."
+            )
 
     baseline_file = encode_baseline(
         input_path,
@@ -356,6 +335,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=['prompt', 'safe', 'balanced'],
         default='prompt',
         help='Expected-QP mode selection behavior.'
+    )
+    parser.add_argument(
+        '--expected-eval',
+        choices=['full', 'sample'],
+        default='sample',
+        help='Expected-QP mode ladder evaluation method.'
     )
 
     parser.add_argument(
@@ -1653,16 +1638,158 @@ def _run_expected_qp_mode(
     gop: int,
     tmpdir: str,
     video_codec: str,
+    scratch_root: str,
 ) -> tuple[str, int, float | None]:
     start_qp = _resolve_expected_start_qp(args)
     print(
         "Expected-QP mode: "
         f"start QP={start_qp}, min_gain={args.expected_min_gain:.2f}%, "
-        f"max_steps={args.expected_max_steps}, knee_ratio={args.expected_knee_ratio:.2f}"
+        f"max_steps={args.expected_max_steps}, knee_ratio={args.expected_knee_ratio:.2f}, "
+        f"eval={args.expected_eval}"
     )
     source_base, source_ext = os.path.splitext(os.path.basename(source_ref_path))
     max_qp = min(args.max_qp, start_qp + max(0, args.expected_max_steps))
 
+    rows: List[Dict[str, Any]]
+    if args.expected_eval == "sample":
+        rows = _build_expected_rows_sample(
+            args=args,
+            baseline_file=baseline_file,
+            raw_fr=raw_fr,
+            gop=gop,
+            audio_opts=audio_opts,
+            video_codec=video_codec,
+            scratch_root=scratch_root,
+            start_qp=start_qp,
+            max_qp=max_qp,
+        )
+    else:
+        rows = _build_expected_rows_full(
+            args=args,
+            baseline_file=baseline_file,
+            raw_fr=raw_fr,
+            gop=gop,
+            audio_opts=audio_opts,
+            video_codec=video_codec,
+            tmpdir=tmpdir,
+            source_base=source_base,
+            source_ext=source_ext,
+            start_qp=start_qp,
+            max_qp=max_qp,
+        )
+
+    if not rows:
+        raise RuntimeError("Expected-QP mode could not produce any full-file encodes.")
+
+    _print_expected_qp_ladder(rows)
+    safe_qp, balanced_qp = _suggest_expected_qps(
+        rows=rows,
+        min_gain_pct=args.expected_min_gain,
+        knee_ratio=args.expected_knee_ratio,
+    )
+    src_codec = probe_video_codec(args.input)
+    src_size = _safe_file_size(args.input) or 0
+    selected_qp = _choose_expected_qp(
+        args=args,
+        rows=rows,
+        safe_qp=safe_qp,
+        balanced_qp=balanced_qp,
+        source_codec=src_codec,
+        source_size_bytes=src_size,
+    )
+    print(
+        f"Expected-QP mode suggestions: safe={safe_qp}, balanced={balanced_qp}. "
+        f"Selected QP={selected_qp}."
+    )
+
+    if args.expected_eval == "sample":
+        output_path, full_ssim = cast(
+            tuple[str, float | None],
+            encode_final(
+                input_file=baseline_file,
+                qp=selected_qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                video_codec=video_codec,
+                return_ssim=True,
+                ssim_chunk_seconds=args.full_ssim_chunk_seconds,
+                output_dir=tmpdir,
+                output_base=source_base,
+                output_ext=source_ext,
+            ),
+        )
+        selected_row = next((row for row in rows if row["qp"] == selected_qp), rows[0])
+        return output_path, selected_qp, full_ssim if full_ssim is not None else selected_row["ssim"]
+
+    return _finalize_expected_full_selection(rows, selected_qp)
+
+
+def _build_expected_rows_sample(
+    args: argparse.Namespace,
+    baseline_file: str,
+    raw_fr: float,
+    gop: int,
+    audio_opts: List[str],
+    video_codec: str,
+    scratch_root: str,
+    start_qp: int,
+    max_qp: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    segments, segments_tmpdir = _prepare_size_segments(
+        baseline_file=baseline_file,
+        args=args,
+        scratch_root=scratch_root,
+    )
+    if not segments:
+        raise RuntimeError("Expected-QP sample mode could not extract sample segments.")
+    try:
+        for qp in range(start_qp, max_qp + 1):
+            sample_metric = measure_ssim(
+                qp=qp,
+                samples=segments,
+                raw_fr=raw_fr,
+                gop=gop,
+                audio_opts=audio_opts,
+                metric=args.metric,
+                video_codec=video_codec,
+            )
+            sample_bytes = _encode_samples_for_qp(
+                segments=segments,
+                qp=qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                tmp_root=scratch_root,
+                video_codec=video_codec,
+            )
+            size_bytes = _estimate_full_size_from_samples(sample_bytes, args.sample_percent)
+            rows.append({
+                "qp": qp,
+                "ssim": float(sample_metric),
+                "size_bytes": int(size_bytes),
+            })
+            _print_expected_step_progress(rows, estimate=True)
+    finally:
+        if segments_tmpdir:
+            shutil.rmtree(segments_tmpdir, ignore_errors=True)
+    return rows
+
+
+def _build_expected_rows_full(
+    args: argparse.Namespace,
+    baseline_file: str,
+    raw_fr: float,
+    gop: int,
+    audio_opts: List[str],
+    video_codec: str,
+    tmpdir: str,
+    source_base: str,
+    source_ext: str,
+    start_qp: int,
+    max_qp: int,
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for qp in range(start_qp, max_qp + 1):
         output_path, ssim_val = cast(
@@ -1691,44 +1818,33 @@ def _run_expected_qp_mode(
             "size_bytes": int(size_bytes),
             "path": output_path,
         })
-        if len(rows) >= 2:
-            prev = rows[-2]
-            gain = _safe_pct_delta(prev["size_bytes"], size_bytes)
-            print(
-                f"  QP {prev['qp']} -> {qp}: size {prev['size_bytes']/1_000_000.0:.1f} -> "
-                f"{size_bytes/1_000_000.0:.1f} MB (gain {gain:.2f}%)"
-            )
+        _print_expected_step_progress(rows, estimate=False)
+    return rows
 
-    if not rows:
-        raise RuntimeError("Expected-QP mode could not produce any full-file encodes.")
 
-    _print_expected_qp_ladder(rows)
-    safe_qp, balanced_qp = _suggest_expected_qps(
-        rows=rows,
-        min_gain_pct=args.expected_min_gain,
-        knee_ratio=args.expected_knee_ratio,
-    )
-    src_codec = probe_video_codec(args.input)
-    src_size = _safe_file_size(args.input) or 0
-    selected_qp = _choose_expected_qp(
-        args=args,
-        rows=rows,
-        safe_qp=safe_qp,
-        balanced_qp=balanced_qp,
-        source_codec=src_codec,
-        source_size_bytes=src_size,
-    )
+def _print_expected_step_progress(rows: List[Dict[str, Any]], estimate: bool) -> None:
+    if len(rows) < 2:
+        return
+    prev = rows[-2]
+    cur = rows[-1]
+    gain = _safe_pct_delta(prev["size_bytes"], cur["size_bytes"])
+    prefix = "est size" if estimate else "size"
     print(
-        f"Expected-QP mode suggestions: safe={safe_qp}, balanced={balanced_qp}. "
-        f"Selected QP={selected_qp}."
+        f"  QP {prev['qp']} -> {cur['qp']}: {prefix} {prev['size_bytes']/1_000_000.0:.1f} -> "
+        f"{cur['size_bytes']/1_000_000.0:.1f} MB (gain {gain:.2f}%)"
     )
 
+
+def _finalize_expected_full_selection(
+    rows: List[Dict[str, Any]],
+    selected_qp: int,
+) -> tuple[str, int, float]:
     selected_row = next((row for row in rows if row["qp"] == selected_qp), rows[0])
     selected_path = selected_row["path"]
-    selected_ssim = selected_row["ssim"]
+    selected_ssim = float(selected_row["ssim"])
     for row in rows:
-        path = row["path"]
-        if path != selected_path:
+        path = row.get("path")
+        if path and path != selected_path:
             try:
                 os.remove(path)
             except OSError:
@@ -1740,7 +1856,6 @@ def _prepare_baseline_and_source(
     args: argparse.Namespace,
     use_size_target: bool,
     crop_filter: str | None,
-    pix_fmt: str,
     baseline_tmp: str,
     video_codec: str,
 ) -> tuple[str, str]:
@@ -1749,7 +1864,6 @@ def _prepare_baseline_and_source(
             baseline_file = _determine_baseline_file(
                 input_path=args.input,
                 skip_baseline=args.skip_baseline,
-                pix_fmt=pix_fmt,
                 baseline_tmp=baseline_tmp,
                 baseline_qp=args.baseline_qp,
                 extra_vf=crop_filter,
@@ -1766,7 +1880,6 @@ def _prepare_baseline_and_source(
     baseline_file = _determine_baseline_file(
         input_path=args.input,
         skip_baseline=args.skip_baseline,
-        pix_fmt=pix_fmt,
         baseline_tmp=baseline_tmp,
         baseline_qp=args.baseline_qp,
         extra_vf=crop_filter,
@@ -1856,11 +1969,9 @@ def _run_size_target_flow(
 
     print("\nRefining with SSIM using size-target output as the source...")
     ssim_input = final_file
-    _, _, ssim_pix_fmt = _probe_video_basics(ssim_input)
     ssim_baseline = _determine_baseline_file(
         input_path=ssim_input,
         skip_baseline=True,
-        pix_fmt=ssim_pix_fmt,
         baseline_tmp=baseline_tmp,
         baseline_qp=args.baseline_qp,
         video_codec=video_codec,
@@ -1948,7 +2059,7 @@ def _maybe_rerun_full_ssim(
 
 def _prepare_main_context(
     args: argparse.Namespace,
-) -> tuple[int, int, str, str | None, bool, str, bool, List[str], float]:
+) -> tuple[str | None, bool, str, bool, List[str], float]:
     width, height, pix_fmt = _probe_video_basics(args.input)
 
     if args.video_codec == "h264":
@@ -1975,12 +2086,11 @@ def _prepare_main_context(
         height=height,
         raw_fr=raw_fr,
     )
-    return width, height, pix_fmt, crop_filter, expected_mode, codec, use_size_target, audio_opts, raw_fr
+    return crop_filter, expected_mode, codec, use_size_target, audio_opts, raw_fr
 
 
 def _run_transcode_pipeline(
     args: argparse.Namespace,
-    pix_fmt: str,
     crop_filter: str | None,
     expected_mode: bool,
     codec: str,
@@ -1999,7 +2109,6 @@ def _run_transcode_pipeline(
             args=args,
             use_size_target=use_size_target,
             crop_filter=crop_filter,
-            pix_fmt=pix_fmt,
             baseline_tmp=baseline_tmp,
             video_codec=args.video_codec,
         )
@@ -2042,6 +2151,7 @@ def _run_transcode_pipeline(
                 gop=gop,
                 tmpdir=tmpdir,
                 video_codec=args.video_codec,
+                scratch_root=scratch_root,
             )
         elif use_size_target:
             final_file, final_qp, final_full_ssim, refine_tmp = _run_size_target_flow(
@@ -2136,9 +2246,6 @@ def main():
 
     try:
         (
-            _width,
-            _height,
-            pix_fmt,
             crop_filter,
             expected_mode,
             codec,
@@ -2150,7 +2257,6 @@ def main():
         return
     _run_transcode_pipeline(
         args=args,
-        pix_fmt=pix_fmt,
         crop_filter=crop_filter,
         expected_mode=expected_mode,
         codec=codec,

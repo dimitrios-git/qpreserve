@@ -52,6 +52,62 @@ def _print_h264_problems(problems: list[str]) -> None:
     print()
 
 
+def _format_bytes_human(num_bytes: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(max(0, num_bytes))
+    idx = 0
+    while size >= 1024.0 and idx < len(units) - 1:
+        size /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(size)} {units[idx]}"
+    return f"{size:.2f} {units[idx]}"
+
+
+def _format_duration_hms(seconds: float) -> str:
+    total = int(max(0.0, seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _safe_get_file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _print_source_profile(input_path: str) -> None:
+    file_size = _safe_get_file_size(input_path)
+    vinfo = probe_video_stream_info(input_path)
+    codec = _normalize_video_codec(probe_video_codec(input_path) or "unknown")
+    fps = probe_video_framerate(input_path)
+    duration = probe_video_duration(input_path)
+    pix_fmt = str(vinfo.get("pix_fmt", "") or "unknown")
+    width = int(vinfo.get("width", 0) or 0)
+    height = int(vinfo.get("height", 0) or 0)
+    hdr_info = detect_hdr(input_path)
+    video_bitrate = probe_video_bitrate(input_path)
+    avg_bitrate = int((file_size * 8) / duration) if duration > 0 and file_size > 0 else 0
+    bitrate_kbps = (video_bitrate or avg_bitrate) / 1000.0 if (video_bitrate or avg_bitrate) > 0 else 0.0
+    pixels_per_sec = float(width) * float(height) * max(fps, 0.0001)
+    bppf = ((video_bitrate or avg_bitrate) / pixels_per_sec) if (video_bitrate or avg_bitrate) > 0 else 0.0
+    dyn_range = "HDR" if hdr_info.get("is_hdr") else "SDR"
+
+    print("\nSource Profile:")
+    print(f"  File: {input_path}")
+    print(
+        f"  Video: {codec} | {width}x{height} @ {fps:.2f} fps | {pix_fmt} | {dyn_range}"
+    )
+    print(
+        f"  Duration: {_format_duration_hms(duration)} | Size: {_format_bytes_human(file_size)}"
+        + (f" | Avg bitrate: ~{bitrate_kbps:.0f} kb/s" if bitrate_kbps > 0 else "")
+        + (f" | bppf: {bppf:.4f}" if bppf > 0 else "")
+    )
+
+
 def _resolve_h264_choice(decision: str | None) -> str:
     if decision in ("abort", "continue"):
         return "1" if decision == "abort" else "2"
@@ -266,8 +322,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--source-quality',
         type=str,
-        help='Enable expected-QP mode. Accepts a numeric QP start (e.g. 22) '
-             'or one of: ultra, high, medium, low. '
+        help='Starting point for expected-QP mode. Accepts a numeric QP start (e.g. 22) '
+             'or one of: ultra, high, medium, low. If omitted, interactive runs prompt for it '
+             '(non-interactive defaults to medium). '
              'Guide: ultra=near-lossless, high=clean, medium=compressed, low=heavily compressed.'
     )
     parser.add_argument(
@@ -285,7 +342,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--expected-max-steps',
         type=int,
-        default=10,
+        default=8,
         help='Expected-QP mode: maximum number of QP steps to explore upward.'
     )
     parser.add_argument(
@@ -1280,6 +1337,30 @@ def _selected_quality_label(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _compute_source_advice(
+    input_path: str,
+    width: int,
+    height: int,
+    raw_fr: float,
+) -> tuple[str, str, float, float]:
+    """
+    Returns (codec, advised_tier, bitrate_kbps, bppf)
+    """
+    duration = probe_video_duration(input_path)
+    try:
+        size_bytes = os.path.getsize(input_path)
+    except OSError:
+        size_bytes = 0
+    src_codec = _normalize_video_codec(probe_video_codec(input_path))
+    stream_br = probe_video_bitrate(input_path)
+    avg_br = int((size_bytes * 8) / duration) if duration > 0 and size_bytes > 0 else 0
+    bitrate_bps = stream_br if stream_br and stream_br > 0 else avg_br
+    pixels_per_sec = max(1.0, float(width) * float(height) * max(raw_fr, 0.0001))
+    bppf = float(bitrate_bps) / pixels_per_sec
+    advised = _tier_for_bppf(src_codec, bppf)
+    return src_codec, advised, bitrate_bps / 1000.0 if bitrate_bps > 0 else 0.0, bppf
+
+
 def _maybe_print_expected_mode_advice(
     args: argparse.Namespace,
     input_path: str,
@@ -1289,29 +1370,20 @@ def _maybe_print_expected_mode_advice(
 ) -> None:
     if not _expected_mode_requested(args):
         return
-    duration = probe_video_duration(input_path)
-    if duration <= 0 or raw_fr <= 0:
+    if raw_fr <= 0:
         return
-    try:
-        size_bytes = os.path.getsize(input_path)
-    except OSError:
-        size_bytes = 0
-    if size_bytes <= 0:
-        return
-
-    src_codec = _normalize_video_codec(probe_video_codec(input_path))
-    stream_br = probe_video_bitrate(input_path)
-    avg_br = int((size_bytes * 8) / duration)
-    bitrate_bps = stream_br if stream_br and stream_br > 0 else avg_br
-    pixels_per_sec = max(1.0, float(width) * float(height) * raw_fr)
-    bppf = float(bitrate_bps) / pixels_per_sec
-    advised = _tier_for_bppf(src_codec, bppf)
+    src_codec, advised, bitrate_kbps, bppf = _compute_source_advice(
+        input_path=input_path,
+        width=width,
+        height=height,
+        raw_fr=raw_fr,
+    )
     selected = _selected_quality_label(args)
 
     print(
         "Source profile: "
         f"{src_codec} {width}x{height}@{raw_fr:.2f}, "
-        f"avg bitrate ~{bitrate_bps/1000:.0f} kb/s, bppf={bppf:.4f}"
+        f"avg bitrate ~{bitrate_kbps:.0f} kb/s, bppf={bppf:.4f}"
     )
     print(f"Heuristic suggested source-quality tier: {advised}.")
     if selected and selected != advised:
@@ -1323,6 +1395,94 @@ def _maybe_print_expected_mode_advice(
 
 def _expected_mode_requested(args: argparse.Namespace) -> bool:
     return bool(args.source_quality) or (args.expected_qp_alias is not None)
+
+
+def _default_choice_for_tier(tier: str) -> str:
+    return {
+        "ultra": "1",
+        "high": "2",
+        "medium": "3",
+        "low": "4",
+    }.get(tier, "3")
+
+
+def _print_source_quality_menu(default_choice: str) -> None:
+    rec_label = {
+        "1": "ultra",
+        "2": "high",
+        "3": "medium",
+        "4": "low",
+    }.get(default_choice, "medium")
+    print("Select source quality tier for Expected-QP mode:")
+    print(f"  [1] ultra{' (recommended)' if rec_label == 'ultra' else ''}")
+    print(f"  [2] high{' (recommended)' if rec_label == 'high' else ''}")
+    print(f"  [3] medium{' (recommended)' if rec_label == 'medium' else ''}")
+    print(f"  [4] low{' (recommended)' if rec_label == 'low' else ''}")
+    print("  [5] Enter numeric QP")
+    print("  [q] Quit")
+
+
+def _resolve_source_quality_choice(default_choice: str) -> str | None:
+    tier_by_choice = {
+        "1": "ultra",
+        "2": "high",
+        "3": "medium",
+        "4": "low",
+    }
+
+    def _prompt_numeric_qp() -> str | None:
+        raw = input("Enter expected starting QP: ").strip()
+        try:
+            int(raw)
+        except ValueError:
+            print("Please enter a valid integer QP.")
+            return None
+        return raw
+
+    while True:
+        choice = input(f"Choose 1-5 or q [{default_choice}]: ").strip().lower()
+        if choice == "":
+            choice = default_choice
+        if choice in {"q", "quit"}:
+            print("Cancelled by user.")
+            return None
+        tier = tier_by_choice.get(choice)
+        if tier:
+            return tier
+        if choice == "5":
+            raw = _prompt_numeric_qp()
+            if raw is None:
+                continue
+            return raw
+        print("Please choose 1, 2, 3, 4, 5, or q.")
+
+
+def _ensure_source_quality_for_default_pipeline(args: argparse.Namespace) -> bool:
+    if _expected_mode_requested(args):
+        return True
+    if not sys.stdin.isatty():
+        args.source_quality = "medium"
+        print("No --source-quality provided; defaulting to 'medium' in non-interactive mode.")
+        return True
+
+    vinfo = probe_video_stream_info(args.input)
+    width = int(vinfo.get("width", 0) or 0)
+    height = int(vinfo.get("height", 0) or 0)
+    fps = probe_video_framerate(args.input)
+    _codec, advised, _bitrate_kbps, _bppf = _compute_source_advice(
+        input_path=args.input,
+        width=width,
+        height=height,
+        raw_fr=fps,
+    )
+
+    default_choice = _default_choice_for_tier(advised)
+    _print_source_quality_menu(default_choice)
+    selected = _resolve_source_quality_choice(default_choice)
+    if selected is None:
+        return False
+    args.source_quality = selected
+    return True
 
 
 def _quality_label_to_qp(label: str) -> int | None:
@@ -1786,55 +1946,25 @@ def _maybe_rerun_full_ssim(
     )
 
 
-def main():
-    parser = _build_arg_parser()
-    args = parser.parse_args()
-    args.video_codec = _normalize_video_codec(args.video_codec)
-
-    # ------------------------------------------------------------
-    # Logging setup
-    # ------------------------------------------------------------
-    setup_logging(args.verbose, args.log_file)
-
-    if args.use_baseline_as_source and args.skip_baseline:
-        print("WARNING: --use-baseline-as-source requires a baseline; ignoring --skip-baseline.")
-        args.skip_baseline = False
-    if args.source_quality and args.expected_qp_alias is not None:
-        print("WARNING: both --source-quality and --expected-qp provided; using --source-quality.")
-
-    if not os.path.isfile(args.input):
-        logging.error("Input file not found: %s", args.input)
-        return
-
-    # ------------------------------------------------------------
-    # Audio-only path: copy video, process audio, skip SSIM pipeline
-    # ------------------------------------------------------------
-    if _maybe_run_audio_only_path(args):
-        return
-
-    # ------------------------------------------------------------
-    # Probe basic video info (for impossible-encode checks)
-    # ------------------------------------------------------------
+def _prepare_main_context(
+    args: argparse.Namespace,
+) -> tuple[int, int, str, str | None, bool, str, bool, List[str], float]:
     width, height, pix_fmt = _probe_video_basics(args.input)
 
     if args.video_codec == "h264":
         if not _confirm_h264_compat(width, height, pix_fmt, decision=args.h264_compat):
-            return
+            raise RuntimeError("aborted_h264_compat")
 
     crop_filter = _resolve_crop_filter(args, width, height)
+    if not _ensure_source_quality_for_default_pipeline(args):
+        raise RuntimeError("cancelled")
 
-    # ------------------------------------------------------------
-    # Decide quality metric path (SSIM vs size-target for modern codecs)
-    # ------------------------------------------------------------
     expected_mode = _expected_mode_requested(args)
     quality_mode = _resolve_quality_mode(args, args.input, force_ssim=expected_mode)
     if quality_mode is None:
-        return
+        raise RuntimeError("invalid_quality_mode")
     codec, use_size_target = quality_mode
 
-    # ------------------------------------------------------------
-    # Probe audio/video from original file
-    # ------------------------------------------------------------
     audio_opts, raw_fr, args.audio_normalize = _prepare_audio_and_framerate(
         args.input, args.audio_normalize, args.add_stereo_downmix
     )
@@ -1845,10 +1975,19 @@ def main():
         height=height,
         raw_fr=raw_fr,
     )
+    return width, height, pix_fmt, crop_filter, expected_mode, codec, use_size_target, audio_opts, raw_fr
 
-    # ------------------------------------------------------------
-    # Prepare temp directories
-    # ------------------------------------------------------------
+
+def _run_transcode_pipeline(
+    args: argparse.Namespace,
+    pix_fmt: str,
+    crop_filter: str | None,
+    expected_mode: bool,
+    codec: str,
+    use_size_target: bool,
+    audio_opts: List[str],
+    raw_fr: float,
+) -> None:
     scratch_root = _resolve_scratch_root(args.scratch_dir)
     baseline_tmp, tmpdir, samples_tmpdir = _prepare_work_dirs(
         scratch_root, args.input, args.skip_baseline
@@ -1856,9 +1995,6 @@ def main():
     refine_tmp: str | None = None
 
     try:
-        # ------------------------------------------------------------
-        # STEP 1 — BASELINE (QP=baseline) ENCODE with PROGRESS (+ optional HDR->SDR)
-        # ------------------------------------------------------------
         baseline_file, source_ref_path = _prepare_baseline_and_source(
             args=args,
             use_size_target=use_size_target,
@@ -1869,17 +2005,10 @@ def main():
         )
 
         target_bytes = _resolve_target_bytes(args, args.input, codec) if use_size_target else 0
-
-        # ------------------------------------------------------------
-        # GOP ~ half framerate
         gop = _calculate_gop(raw_fr)
-
         samples: list[str] = []
         best_qp = args.initial_qp if args.initial_qp is not None else args.min_qp
 
-        # ------------------------------------------------------------
-        # STEP 2 — SAMPLE CLIP EXTRACTION (optional)
-        # ------------------------------------------------------------
         if not expected_mode:
             if use_size_target:
                 best_qp, samples_tmpdir, samples = _select_best_qp_for_size_target(
@@ -1887,11 +2016,11 @@ def main():
                     baseline_file=baseline_file,
                     audio_opts=audio_opts,
                     raw_fr=raw_fr,
-                gop=gop,
-                scratch_root=scratch_root,
-                target_bytes=target_bytes,
-                video_codec=args.video_codec,
-            )
+                    gop=gop,
+                    scratch_root=scratch_root,
+                    target_bytes=target_bytes,
+                    video_codec=args.video_codec,
+                )
             else:
                 best_qp, samples_tmpdir, samples = _select_best_qp_for_ssim(
                     args=args,
@@ -1903,9 +2032,6 @@ def main():
                     scratch_root=scratch_root,
                 )
 
-        # ------------------------------------------------------------
-        # STEP 4 — FULL-FILE FINAL ENCODE DESCENT (CLEANER OUTPUT)
-        # ------------------------------------------------------------
         if expected_mode:
             final_file, final_qp, final_full_ssim = _run_expected_qp_mode(
                 args=args,
@@ -1964,9 +2090,6 @@ def main():
             final_qp = rerun_qp
             final_full_ssim = rerun_ssim
 
-        # ------------------------------------------------------------
-        # STEP 5 — MOVE FINAL RESULT TO SOURCE DIRECTORY
-        # ------------------------------------------------------------
         final_path: str = final_file
         dest_name: str = os.path.basename(final_path)
         dest: str = os.path.join(os.path.dirname(args.input), dest_name)
@@ -1975,13 +2098,66 @@ def main():
         print(f"Optimized file: {dest} (QP={final_qp})")
 
     finally:
-        # Cleanup temporary dirs
         if samples_tmpdir:
             shutil.rmtree(samples_tmpdir, ignore_errors=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
         shutil.rmtree(baseline_tmp, ignore_errors=True)
         if refine_tmp:
             shutil.rmtree(refine_tmp, ignore_errors=True)
+
+
+def main():
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    args.video_codec = _normalize_video_codec(args.video_codec)
+
+    # ------------------------------------------------------------
+    # Logging setup
+    # ------------------------------------------------------------
+    setup_logging(args.verbose, args.log_file)
+
+    if args.use_baseline_as_source and args.skip_baseline:
+        print("WARNING: --use-baseline-as-source requires a baseline; ignoring --skip-baseline.")
+        args.skip_baseline = False
+    if args.source_quality and args.expected_qp_alias is not None:
+        print("WARNING: both --source-quality and --expected-qp provided; using --source-quality.")
+
+    if not os.path.isfile(args.input):
+        logging.error("Input file not found: %s", args.input)
+        return
+
+    _print_source_profile(args.input)
+
+    # ------------------------------------------------------------
+    # Audio-only path: copy video, process audio, skip SSIM pipeline
+    # ------------------------------------------------------------
+    if _maybe_run_audio_only_path(args):
+        return
+
+    try:
+        (
+            _width,
+            _height,
+            pix_fmt,
+            crop_filter,
+            expected_mode,
+            codec,
+            use_size_target,
+            audio_opts,
+            raw_fr,
+        ) = _prepare_main_context(args)
+    except RuntimeError:
+        return
+    _run_transcode_pipeline(
+        args=args,
+        pix_fmt=pix_fmt,
+        crop_filter=crop_filter,
+        expected_mode=expected_mode,
+        codec=codec,
+        use_size_target=use_size_target,
+        audio_opts=audio_opts,
+        raw_fr=raw_fr,
+    )
 
 
 if __name__ == "__main__":

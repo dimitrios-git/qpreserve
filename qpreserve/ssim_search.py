@@ -222,6 +222,25 @@ def measure_ssim(
     return results[metric]
 
 
+def measure_ssim_values(
+    qp: int,
+    samples: List[str],
+    raw_fr: float,
+    gop: int,
+    audio_opts: List[str],
+    video_codec: str = "h264",
+) -> List[float]:
+    """
+    Return per-sample SSIM values at the given QP.
+    """
+    vals: List[float] = []
+    pbar = tqdm(samples, desc=f"SSIM@QP{qp}", leave=False)
+    for s in pbar:
+        vals.append(measure_ssim_on_sample(s, qp, raw_fr, gop, audio_opts, video_codec))
+    pbar.close()
+    return vals
+
+
 def find_best_qp(
     samples: List[str],
     min_qp: int,

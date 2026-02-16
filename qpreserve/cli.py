@@ -16,6 +16,7 @@ import os
 import tempfile
 import shutil
 from statistics import mean, median
+import math
 from typing import Any, Dict, List, cast
 
 from .probes import (
@@ -35,7 +36,7 @@ from .utils import (
     has_filter,
 )
 from .sampling import extract_samples, extract_sample_segments
-from .ssim_search import find_best_qp, measure_ssim
+from .ssim_search import find_best_qp, measure_ssim, measure_ssim_values
 from .encoder import encode_final, encode_baseline
 
 def _normalize_video_codec(video_codec: str) -> str:
@@ -262,6 +263,23 @@ def _determine_baseline_file(
     return baseline_file
 
 
+def _maybe_enable_default_skip_baseline(
+    args: argparse.Namespace,
+    input_path: str,
+    crop_filter: str | None,
+) -> None:
+    if args.skip_baseline:
+        return
+    if crop_filter is not None:
+        return
+    if args.use_baseline_as_source:
+        return
+    src_codec = _normalize_video_codec(probe_video_codec(input_path))
+    if src_codec == "h265":
+        args.skip_baseline = True
+        print("Skipping baseline generation by default for h265/hevc source.")
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Optimize video quality via perceptual metric and QP binary search.',
@@ -287,10 +305,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='Maximum QP allowed during search.')
 
     # Sampling configuration
-    parser.add_argument('--sample-percent', type=float, default=15,
-                        help='Percentage of video duration used for sampling.')
-    parser.add_argument('--sample-count', type=int, default=3,
-                        help='How many sample clips to extract.')
+    parser.add_argument(
+        '--sample-percent',
+        type=str,
+        default='auto',
+        help="Percentage of video duration used for sampling. Use a number or 'auto'."
+    )
+    parser.add_argument(
+        '--sample-count',
+        type=str,
+        default='auto',
+        help="How many sample clips to extract. Use an integer or 'auto'."
+    )
     parser.add_argument('--sample-qp', type=int, default=6,
                         help='QP used to encode sample clips.')
     parser.add_argument(
@@ -409,8 +435,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--skip-baseline',
         action='store_true',
-        help='Skip baseline generation and use source directly. Only recommended for sources '
-             'that are already SDR, yuv420p, and BT.709. Ignored for HDR sources.'
+        help='Skip baseline generation and use source directly. This is enabled automatically '
+             'for h265/hevc sources (unless crop or baseline-as-source requires baseline).'
     )
     parser.add_argument(
         '--use-baseline-as-source',
@@ -736,6 +762,67 @@ def _prepare_size_segments(
     if not segments_tmpdir:
         segments_tmpdir = None
     return segments, segments_tmpdir
+
+
+def _auto_sample_count_for_duration(duration_sec: float) -> int:
+    if duration_sec <= 0:
+        return 8
+    minutes = duration_sec / 60.0
+    # Favor timeline coverage over long clips: about one sample per ~4 minutes.
+    return max(4, min(12, int(math.ceil(minutes / 4.0))))
+
+
+def _auto_sample_percent_for_duration(duration_sec: float) -> float:
+    if duration_sec <= 0:
+        return 20.0
+    minutes = duration_sec / 60.0
+    if minutes < 20.0:
+        return 40.0
+    if minutes < 45.0:
+        return 30.0
+    if minutes <= 90.0:
+        return 20.0
+    return 15.0
+
+
+def _resolve_sample_percent(args: argparse.Namespace, input_path: str) -> None:
+    raw_value = str(args.sample_percent).strip().lower()
+    if raw_value == "auto":
+        duration_sec = probe_video_duration(input_path)
+        auto_percent = _auto_sample_percent_for_duration(duration_sec)
+        args.sample_percent = auto_percent
+        print(
+            f"Sampling config: --sample-percent auto -> {auto_percent:.1f}% "
+            f"(duration {_format_duration_hms(duration_sec)})."
+        )
+        return
+    try:
+        percent = float(raw_value)
+    except ValueError:
+        raise ValueError("--sample-percent must be a number in (0, 100] or 'auto'.")
+    if percent <= 0.0 or percent > 100.0:
+        raise ValueError("--sample-percent must be in (0, 100].")
+    args.sample_percent = percent
+
+
+def _resolve_sample_count(args: argparse.Namespace, input_path: str) -> None:
+    raw_value = str(args.sample_count).strip().lower()
+    if raw_value == "auto":
+        duration_sec = probe_video_duration(input_path)
+        auto_count = _auto_sample_count_for_duration(duration_sec)
+        args.sample_count = auto_count
+        print(
+            f"Sampling config: --sample-count auto -> {auto_count} "
+            f"(duration {_format_duration_hms(duration_sec)})."
+        )
+        return
+    try:
+        count = int(raw_value)
+    except ValueError:
+        raise ValueError("--sample-count must be an integer >= 1 or 'auto'.")
+    if count < 1:
+        raise ValueError("--sample-count must be >= 1.")
+    args.sample_count = count
 
 
 def _estimate_full_size_for_qp(
@@ -1405,6 +1492,8 @@ def _print_source_quality_menu(default_choice: str) -> None:
     print(f"  [4] low{' (recommended)' if rec_label == 'low' else ''}")
     print("  [5] Enter numeric QP")
     print("  [q] Quit")
+    print("Note: recommendation is estimated from bitrate per pixel per frame.")
+    print("It is usually accurate, but can be misleading for low-quality sources with inflated bitrate.")
 
 
 def _resolve_source_quality_choice(default_choice: str) -> str | None:
@@ -1533,6 +1622,22 @@ def _transition_velocity(
     return ssim_drop / (size_saved_mb / 100.0)
 
 
+def _tail_drop_worst_fraction(
+    base_vals: List[float],
+    cur_vals: List[float],
+    fraction: float = 0.5,
+) -> float:
+    if not base_vals or not cur_vals:
+        return 0.0
+    n = min(len(base_vals), len(cur_vals))
+    if n <= 0:
+        return 0.0
+    drops = [max(0.0, base_vals[i] - cur_vals[i]) for i in range(n)]
+    k = max(1, int(math.ceil(n * fraction)))
+    worst = sorted(drops, reverse=True)[:k]
+    return mean(worst) if worst else 0.0
+
+
 def _print_expected_qp_ladder(rows: List[Dict[str, Any]]) -> None:
     print("\nExpected-QP ladder summary:")
     print("  qp  size_mb   ssim      size_saved_mb  size_saved_pct  ssim_drop  drop_per_100mb")
@@ -1606,13 +1711,31 @@ def _suggest_expected_qps(
     if not valid:
         return rows[-2]["qp"], rows[-1]["qp"]
 
+    # Rolling-window knee: compare local mean velocity before/after each candidate.
+    # This is more robust than single-step ratio checks on noisy sample ladders.
     knee_index = None
-    prev_vel = None
-    for i, _gain, vel in valid:
-        if prev_vel is not None and prev_vel > 0 and vel >= prev_vel * knee_ratio:
-            knee_index = i
-            break
-        prev_vel = vel
+    window = 2
+    velocity_floor = 0.00008
+    if len(valid) >= window * 2:
+        idxs = [t[0] for t in valid]
+        vels = [t[2] for t in valid]
+        for j in range(window, len(valid) - window + 1):
+            pre = mean(vels[j - window:j])
+            post = mean(vels[j:j + window])
+            if pre <= 0:
+                continue
+            if post >= velocity_floor and post >= pre * knee_ratio:
+                knee_index = idxs[j]
+                break
+
+    # Fallback to the legacy step ratio when rolling-window cannot decide.
+    if knee_index is None:
+        prev_vel = None
+        for i, _gain, vel in valid:
+            if prev_vel is not None and prev_vel > 0 and vel >= prev_vel * knee_ratio:
+                knee_index = i
+                break
+            prev_vel = vel
 
     if knee_index is None:
         mid = valid[len(valid) // 2][0]
@@ -1630,14 +1753,16 @@ def _choose_expected_qp(
     balanced_qp: int,
     source_codec: str,
     source_size_bytes: int,
+    size_is_estimate: bool = False,
 ) -> int:
     by_qp = {row["qp"]: row for row in rows}
     safe_size = by_qp[safe_qp]["size_bytes"] / 1_000_000.0
     balanced_size = by_qp[balanced_qp]["size_bytes"] / 1_000_000.0
+    size_label = "est. size" if size_is_estimate else "size"
     print("\nExpected-QP suggestions:")
     print(f"  Source codec: {source_codec}, size: {source_size_bytes/1_000_000.0:.2f} MB")
-    print(f"  [1] Safe (recommended): QP={safe_qp}, size={safe_size:.2f} MB")
-    print(f"  [2] Balanced: QP={balanced_qp}, size={balanced_size:.2f} MB")
+    print(f"  [1] Safe (recommended): QP={safe_qp}, {size_label}={safe_size:.2f} MB")
+    print(f"  [2] Balanced: QP={balanced_qp}, {size_label}={balanced_size:.2f} MB")
 
     if args.expected_choice == "safe":
         return safe_qp
@@ -1722,6 +1847,7 @@ def _run_expected_qp_mode(
         balanced_qp=balanced_qp,
         source_codec=src_codec,
         source_size_bytes=src_size,
+        size_is_estimate=(args.expected_eval == "sample"),
     )
     print(
         f"Expected-QP mode suggestions: safe={safe_qp}, balanced={balanced_qp}. "
@@ -1763,6 +1889,9 @@ def _build_expected_rows_sample(
     max_qp: int,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    baseline_vals: List[float] | None = None
+    baseline_metric = 0.0
+    prev_tail_drop = 0.0
     segments, segments_tmpdir = _prepare_size_segments(
         baseline_file=baseline_file,
         args=args,
@@ -1772,15 +1901,29 @@ def _build_expected_rows_sample(
         raise RuntimeError("Expected-QP sample mode could not extract sample segments.")
     try:
         for qp in range(start_qp, max_qp + 1):
-            sample_metric = measure_ssim(
+            sample_vals = measure_ssim_values(
                 qp=qp,
                 samples=segments,
                 raw_fr=raw_fr,
                 gop=gop,
                 audio_opts=audio_opts,
-                metric=args.metric,
                 video_codec=video_codec,
             )
+            sample_metric = mean(sample_vals) if sample_vals else 0.0
+            if baseline_vals is None:
+                baseline_vals = sample_vals
+                baseline_metric = sample_metric
+                effective_metric = sample_metric
+            else:
+                tail_drop = _tail_drop_worst_fraction(
+                    baseline_vals,
+                    sample_vals,
+                    fraction=0.5,
+                )
+                # Enforce monotonic degradation to reduce SSIM jitter effects.
+                tail_drop = max(prev_tail_drop, tail_drop)
+                prev_tail_drop = tail_drop
+                effective_metric = max(0.0, baseline_metric - tail_drop)
             sample_bytes = _encode_samples_for_qp(
                 segments=segments,
                 qp=qp,
@@ -1793,9 +1936,15 @@ def _build_expected_rows_sample(
             size_bytes = _estimate_full_size_from_samples(sample_bytes, args.sample_percent)
             rows.append({
                 "qp": qp,
-                "ssim": float(sample_metric),
+                "ssim": float(effective_metric),
+                "raw_ssim": float(sample_metric),
                 "size_bytes": int(size_bytes),
             })
+            tqdm_msg = (
+                f"Expected-QP sample metric at QP={qp}: "
+                f"raw_avg={sample_metric:.6f}, effective={effective_metric:.6f}"
+            )
+            print(tqdm_msg)
             _print_expected_step_progress(rows, estimate=True)
     finally:
         if segments_tmpdir:
@@ -2087,12 +2236,15 @@ def _prepare_main_context(
     args: argparse.Namespace,
 ) -> tuple[str | None, bool, str, bool, List[str], float]:
     width, height, pix_fmt = _probe_video_basics(args.input)
+    _resolve_sample_percent(args, args.input)
+    _resolve_sample_count(args, args.input)
 
     if args.video_codec == "h264":
         if not _confirm_h264_compat(width, height, pix_fmt, decision=args.h264_compat):
             raise RuntimeError("aborted_h264_compat")
 
     crop_filter = _resolve_crop_filter(args, width, height)
+    _maybe_enable_default_skip_baseline(args, args.input, crop_filter)
     if not _ensure_source_quality_for_default_pipeline(args):
         raise RuntimeError("cancelled")
 
@@ -2279,6 +2431,9 @@ def main():
             audio_opts,
             raw_fr,
         ) = _prepare_main_context(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return
     except RuntimeError:
         return
     _run_transcode_pipeline(

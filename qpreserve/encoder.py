@@ -30,6 +30,11 @@ def _cpu_encoder_for(video_codec: str) -> str:
     return "libx265" if codec == "h265" else "libx264"
 
 
+def _output_codec_tag(video_codec: str) -> str:
+    codec = _normalize_video_codec(video_codec)
+    return "hevc" if codec == "h265" else "avc"
+
+
 def _is_10bit_pix_fmt(pix_fmt: str) -> bool:
     p = (pix_fmt or "").lower()
     return "10" in p or "p010" in p
@@ -555,6 +560,8 @@ def encode_final(
     output_dir: str | None = None,
     output_base: str | None = None,
     output_ext: str | None = None,
+    extra_vf: str | None = None,
+    output_resolution_label: str | None = None,
 ) -> str | tuple[str, float | None]:
     """
     Final encode (from the baseline file), with FFmpeg progress and optional SSIM.
@@ -586,10 +593,10 @@ def encode_final(
     source_pix_fmt = str(source_vinfo.get("pix_fmt", "") or "")
 
     # Get resolution label and format framerate
-    resolution = _get_resolution_label(input_file)
+    resolution = output_resolution_label or _get_resolution_label(input_file)
     fps_int = int(round(raw_fr))
     
-    encoder_tag = nvenc_encoder
+    encoder_tag = _output_codec_tag(codec_norm)
     # New format: [codec resolution qp XX].source.ext
     filename = f"{base} [{encoder_tag} {resolution}{fps_int} qp {qp}].source{ext}"
     if output_dir:
@@ -602,7 +609,9 @@ def encode_final(
     color_opts: list[str] = []
     pix_fmt = "yuv420p"
     if codec_norm == "h264":
-        vf_opts = ['-vf', _build_bt709_tag_filter()]
+        filter_chain = _merge_filters(extra_vf, _build_bt709_tag_filter())
+        if filter_chain:
+            vf_opts = ['-vf', filter_chain]
         color_opts = [
             '-color_range', 'tv',
             '-color_primaries', 'bt709',
@@ -610,6 +619,8 @@ def encode_final(
             '-colorspace', 'bt709',
         ]
     else:
+        if extra_vf:
+            vf_opts = ['-vf', extra_vf]
         pix_fmt = 'p010le' if _is_10bit_pix_fmt(source_pix_fmt) else 'yuv420p'
         color_opts = _build_source_color_args(hdr_info)
 

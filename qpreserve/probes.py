@@ -86,12 +86,12 @@ def detect_hdr(input_file: str) -> Dict[str, Any]:
 
 def probe_video_stream_info(input_file: str) -> Dict[str, Any]:
     """
-    Return width, height, pix_fmt of the first video stream.
+    Return basic geometry info of the first video stream.
     """
     res = run_cmd([
         'ffprobe', '-v', 'quiet',
         '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height,pix_fmt',
+        '-show_entries', 'stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio',
         '-of', 'json',
         input_file
     ], capture_output=True)
@@ -102,7 +102,9 @@ def probe_video_stream_info(input_file: str) -> Dict[str, Any]:
     return {
         "width": int(st.get('width', 0) or 0),
         "height": int(st.get('height', 0) or 0),
-        "pix_fmt": st.get('pix_fmt', '')
+        "pix_fmt": st.get('pix_fmt', ''),
+        "sample_aspect_ratio": st.get('sample_aspect_ratio', ''),
+        "display_aspect_ratio": st.get('display_aspect_ratio', ''),
     }
 
 

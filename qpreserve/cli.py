@@ -75,6 +75,7 @@ _VIDEO_EXTENSIONS = {
 }
 
 _QP_FOR_TIER: Dict[str, int] = {"ultra": 9, "high": 13, "medium": 21, "low": 25}
+_TIER_ORDER = ["ultra", "high", "medium", "low"]
 _SSIM_FLAT_VELOCITY_FLOOR = 0.00008
 _SSIM_FLAT_CUMULATIVE_DROP = 0.0008
 _SSIM_FLAT_RANGE = 0.0005
@@ -1716,6 +1717,15 @@ def _tier_for_bppf(codec: str, bppf: float) -> str:
     return "low"
 
 
+def _next_lower_tier(tier: str) -> str | None:
+    """Return the next lower quality tier, or None if already at the lowest."""
+    try:
+        idx = _TIER_ORDER.index(tier.lower())
+    except ValueError:
+        return None
+    return _TIER_ORDER[idx + 1] if idx + 1 < len(_TIER_ORDER) else None
+
+
 def _selected_quality_label(args: argparse.Namespace) -> str | None:
     if not args.source_quality:
         return None
@@ -3303,19 +3313,66 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         rep_path = str(rep["path"])
         print(f"\n[Cluster {cluster['id']}] Sampling representative: {rep_path}")
 
-        rep_args = argparse.Namespace(**vars(args))
-        rep_args.input = rep_path
-        if not rep_args.source_quality:
-            advised = _tier_for_bppf(str(rep["codec"]), float(rep["bppf"]))
-            rep_args.source_quality = advised
-            print(
-                f"[Cluster {cluster['id']}] No --source-quality provided; "
-                f"using heuristic tier '{advised}' for representative."
-            )
-        try:
-            _dest, cluster_qp = _run_single_file_pipeline(rep_args)
-        except Exception as exc:
-            print(f"[Cluster {cluster['id']}] ERROR: representative failed: {exc}")
+        # Track whether the tier was auto-detected so we know whether to retry.
+        heuristic_tier = not bool(args.source_quality)
+        initial_tier = (
+            _tier_for_bppf(str(rep["codec"]), float(rep["bppf"]))
+            if heuristic_tier
+            else str(args.source_quality)
+        )
+
+        cluster_dest: str | None = None
+        cluster_qp: int | None = None
+        current_tier = initial_tier
+
+        while True:
+            rep_args = argparse.Namespace(**vars(args))
+            rep_args.input = rep_path
+            rep_args.source_quality = current_tier
+            if heuristic_tier:
+                print(
+                    f"[Cluster {cluster['id']}] No --source-quality provided; "
+                    f"using heuristic tier '{current_tier}' for representative."
+                )
+            try:
+                cluster_dest, cluster_qp = _run_single_file_pipeline(rep_args)
+            except Exception as exc:
+                print(f"[Cluster {cluster['id']}] ERROR: representative failed: {exc}")
+                cluster_dest = None
+                cluster_qp = None
+                break
+
+            if heuristic_tier:
+                try:
+                    out_size = os.path.getsize(cluster_dest)
+                    src_size = os.path.getsize(rep_path)
+                except OSError:
+                    break
+                if out_size > src_size:
+                    next_tier = _next_lower_tier(current_tier)
+                    if next_tier is None:
+                        print(
+                            f"[Cluster {cluster['id']}] WARNING: output "
+                            f"({out_size / 1e6:.1f} MB) is larger than source "
+                            f"({src_size / 1e6:.1f} MB) at lowest tier 'low'; keeping result."
+                        )
+                    else:
+                        print(
+                            f"[Cluster {cluster['id']}] Output ({out_size / 1e6:.1f} MB) > "
+                            f"source ({src_size / 1e6:.1f} MB); retrying at lower tier "
+                            f"'{next_tier}'."
+                        )
+                        try:
+                            os.remove(cluster_dest)
+                        except OSError:
+                            pass
+                        current_tier = next_tier
+                        cluster_dest = None
+                        cluster_qp = None
+                        continue
+            break
+
+        if cluster_dest is None or cluster_qp is None:
             continue
         processed += 1
         print(f"[Cluster {cluster['id']}] Learned QP={cluster_qp}. Applying to peers.")

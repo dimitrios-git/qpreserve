@@ -82,6 +82,14 @@ _SSIM_FLAT_RANGE = 0.0005
 _SSIM_FULL_DISCREPANCY_THRESHOLD = 0.02
 
 
+class BatchOutputLargerThanSourceError(Exception):
+    """Raised by the expected-QP pipeline when the ladder predicts output > source.
+
+    Caught by batch mode to retry the cluster representative at a lower quality tier
+    without wasting time on a final encode that is already known to be too large.
+    """
+
+
 def _print_h264_problems(problems: list[str]) -> None:
     print("The source video may not be safely encodable with H.264/NVENC:")
     for problem in problems:
@@ -2378,6 +2386,20 @@ def _run_expected_qp_mode(
         f"Selected QP(s)={selected_qps}."
     )
 
+    # In batch mode with a heuristic tier, check the ladder estimate before encoding.
+    # If the selected QP already predicts an output larger than the source, bail out
+    # early so the caller can retry with a lower tier without wasting a full encode.
+    batch_size_limit: int | None = getattr(args, "batch_heuristic_size_limit", None)
+    if batch_size_limit is not None:
+        selected_row = next((r for r in rows if r["qp"] == selected_qp), None)
+        if selected_row is not None:
+            est_size = int(selected_row.get("size_bytes", 0))
+            if est_size > batch_size_limit:
+                raise BatchOutputLargerThanSourceError(
+                    f"estimated {est_size / 1e6:.1f} MB > source "
+                    f"{batch_size_limit / 1e6:.1f} MB at QP={selected_qp}"
+                )
+
     extra_paths: list[str] = []
     if args.expected_eval == "sample":
         print("Expected-QP sample mode: skipping post-selection full-file SSIM measurement.")
@@ -3334,42 +3356,31 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
                     f"[Cluster {cluster['id']}] No --source-quality provided; "
                     f"using heuristic tier '{current_tier}' for representative."
                 )
+                # Pass source size to the pipeline only when a lower tier exists.
+                # When already at 'low', skip the check so the encode runs regardless.
+                if _next_lower_tier(current_tier) is not None:
+                    try:
+                        rep_args.batch_heuristic_size_limit = os.path.getsize(rep_path)
+                    except OSError:
+                        pass
+
             try:
                 cluster_dest, cluster_qp = _run_single_file_pipeline(rep_args)
+            except BatchOutputLargerThanSourceError as exc:
+                next_tier = _next_lower_tier(current_tier)
+                # next_tier is always non-None here because we only set the size limit
+                # when a lower tier exists (see above).
+                print(
+                    f"[Cluster {cluster['id']}] {exc}; "
+                    f"retrying at lower tier '{next_tier}'."
+                )
+                current_tier = next_tier  # type: ignore[assignment]
+                continue
             except Exception as exc:
                 print(f"[Cluster {cluster['id']}] ERROR: representative failed: {exc}")
                 cluster_dest = None
                 cluster_qp = None
                 break
-
-            if heuristic_tier:
-                try:
-                    out_size = os.path.getsize(cluster_dest)
-                    src_size = os.path.getsize(rep_path)
-                except OSError:
-                    break
-                if out_size > src_size:
-                    next_tier = _next_lower_tier(current_tier)
-                    if next_tier is None:
-                        print(
-                            f"[Cluster {cluster['id']}] WARNING: output "
-                            f"({out_size / 1e6:.1f} MB) is larger than source "
-                            f"({src_size / 1e6:.1f} MB) at lowest tier 'low'; keeping result."
-                        )
-                    else:
-                        print(
-                            f"[Cluster {cluster['id']}] Output ({out_size / 1e6:.1f} MB) > "
-                            f"source ({src_size / 1e6:.1f} MB); retrying at lower tier "
-                            f"'{next_tier}'."
-                        )
-                        try:
-                            os.remove(cluster_dest)
-                        except OSError:
-                            pass
-                        current_tier = next_tier
-                        cluster_dest = None
-                        cluster_qp = None
-                        continue
             break
 
         if cluster_dest is None or cluster_qp is None:

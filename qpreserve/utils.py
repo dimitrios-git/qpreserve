@@ -177,14 +177,44 @@ def _finalize_ffmpeg_progress(
 
 
 # ────────────────────────────────────────────────
+# CODEC HELPERS
+# ────────────────────────────────────────────────
+
+def normalize_video_codec(video_codec: str) -> str:
+    codec = (video_codec or "h264").lower()
+    if codec == "hevc":
+        return "h265"
+    return codec
+
+
+def nvenc_encoder_for(video_codec: str) -> str:
+    return "hevc_nvenc" if normalize_video_codec(video_codec) == "h265" else "h264_nvenc"
+
+
+def nvenc_pix_fmt_for(video_codec: str) -> str:
+    return "p010le" if normalize_video_codec(video_codec) == "h265" else "yuv420p"
+
+
+def cpu_encoder_for(video_codec: str) -> str:
+    return "libx265" if normalize_video_codec(video_codec) == "h265" else "libx264"
+
+
+def output_codec_tag(video_codec: str) -> str:
+    return "hevc" if normalize_video_codec(video_codec) == "h265" else "avc"
+
+
+# ────────────────────────────────────────────────
 # AUDIO STREAM LOGIC
 # ────────────────────────────────────────────────
+
+DEFAULT_LOUDNORM_FILTER = "loudnorm=I=-23:TP=-2:LRA=11"
+
 
 def build_audio_options(
     streams: List[Dict[str, Any]],
     normalize: bool = True,
     add_stereo_downmix: bool = False,
-    loudnorm_filter: str = "loudnorm=I=-23:TP=-2:LRA=11",
+    loudnorm_filter: str = DEFAULT_LOUDNORM_FILTER,
 ) -> List[str]:
     """
     Build FFmpeg audio options for all audio streams.

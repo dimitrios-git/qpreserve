@@ -14,7 +14,10 @@ def probe_video_framerate(input_file: str) -> float:
     ], capture_output=True)
 
     data = json.loads(res.stdout)
-    rate = data['streams'][0]['r_frame_rate']
+    streams = data.get('streams') or []
+    if not streams:
+        raise ValueError(f"No video stream found in: {input_file}")
+    rate = streams[0]['r_frame_rate']
     num, den = rate.split('/')
     return float(num) / float(den)
 
@@ -28,7 +31,11 @@ def probe_video_duration(input_file: str) -> float:
     ], capture_output=True)
 
     data = json.loads(res.stdout)
-    return float(data['format']['duration'])
+    fmt = data.get('format') or {}
+    duration = fmt.get('duration')
+    if duration is None:
+        raise ValueError(f"No duration found in: {input_file}")
+    return float(duration)
 
 
 def probe_audio_streams(input_file: str) -> List[Dict[str, Any]]:
@@ -64,7 +71,10 @@ def detect_hdr(input_file: str) -> Dict[str, Any]:
     ], capture_output=True)
 
     data = json.loads(res.stdout)
-    st = data['streams'][0]
+    streams = data.get('streams') or []
+    if not streams:
+        raise ValueError(f"No video stream found in: {input_file}")
+    st = streams[0]
 
     prim = st.get('color_primaries', '').lower()
     tr = st.get('color_transfer', '').lower()
@@ -97,7 +107,10 @@ def probe_video_stream_info(input_file: str) -> Dict[str, Any]:
     ], capture_output=True)
 
     data = json.loads(res.stdout)
-    st = data['streams'][0]
+    streams = data.get('streams') or []
+    if not streams:
+        raise ValueError(f"No video stream found in: {input_file}")
+    st = streams[0]
 
     return {
         "width": int(st.get('width', 0) or 0),
@@ -121,8 +134,10 @@ def probe_video_codec(input_file: str) -> str:
     ], capture_output=True)
 
     data = json.loads(res.stdout)
-    st = data['streams'][0]
-    return (st.get('codec_name', '') or '').lower()
+    streams = data.get('streams') or []
+    if not streams:
+        raise ValueError(f"No video stream found in: {input_file}")
+    return (streams[0].get('codec_name', '') or '').lower()
 
 
 def probe_video_bitrate(input_file: str) -> int | None:

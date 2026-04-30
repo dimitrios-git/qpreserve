@@ -6,33 +6,18 @@ import subprocess
 import tempfile
 from typing import Dict, List, Sequence, Any, Tuple
 
-from .utils import run_ffmpeg_progress
+from .utils import (
+    run_ffmpeg_progress,
+    normalize_video_codec,
+    nvenc_encoder_for,
+    cpu_encoder_for,
+    output_codec_tag,
+)
 from .probes import (
     probe_video_duration,
     detect_hdr,
     probe_video_stream_info,
 )
-
-def _normalize_video_codec(video_codec: str) -> str:
-    codec = (video_codec or "h264").lower()
-    if codec == "hevc":
-        return "h265"
-    return codec
-
-
-def _nvenc_encoder_for(video_codec: str) -> str:
-    codec = _normalize_video_codec(video_codec)
-    return "hevc_nvenc" if codec == "h265" else "h264_nvenc"
-
-
-def _cpu_encoder_for(video_codec: str) -> str:
-    codec = _normalize_video_codec(video_codec)
-    return "libx265" if codec == "h265" else "libx264"
-
-
-def _output_codec_tag(video_codec: str) -> str:
-    codec = _normalize_video_codec(video_codec)
-    return "hevc" if codec == "h265" else "avc"
 
 
 def _is_10bit_pix_fmt(pix_fmt: str) -> bool:
@@ -40,11 +25,14 @@ def _is_10bit_pix_fmt(pix_fmt: str) -> bool:
     return "10" in p or "p010" in p
 
 
-def _build_source_color_args(hdr_info: Dict[str, Any]) -> list[str]:
+def _build_resolved_color_meta(hdr_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve output color metadata and mark whether any unknown field was filled."""
     prim = str(hdr_info.get("primaries") or "").lower()
     tr = str(hdr_info.get("transfer") or "").lower()
     mat = str(hdr_info.get("matrix") or "").lower()
+    filled_unknown = False
 
+    unknown_tokens = {"", "unknown", "unspecified", "undefined", "undef", "n/a", "na"}
     tr_aliases = {
         "bt470bg": "gamma28",
         "bt470m": "gamma22",
@@ -54,19 +42,96 @@ def _build_source_color_args(hdr_info: Dict[str, Any]) -> list[str]:
     }
     tr = tr_aliases.get(tr, tr)
 
-    if not prim:
+    if prim in unknown_tokens:
         prim = "bt2020" if hdr_info.get("is_hdr") else "bt709"
-    if not tr:
+        filled_unknown = True
+    if tr in unknown_tokens:
         tr = "smpte2084" if hdr_info.get("is_hdr") else "bt709"
-    if not mat:
+        filled_unknown = True
+    if mat in unknown_tokens:
         mat = "bt2020nc" if hdr_info.get("is_hdr") else "bt709"
+        filled_unknown = True
 
+    return {
+        "range": "tv",
+        "primaries": prim,
+        "transfer": tr,
+        "matrix": mat,
+        "filled_unknown": filled_unknown,
+    }
+
+
+def _build_color_args_from_meta(meta: Dict[str, Any]) -> list[str]:
     return [
-        "-color_range", "tv",
-        "-color_primaries", prim,
-        "-color_trc", tr,
-        "-colorspace", mat,
+        "-color_range", str(meta.get("range", "tv")),
+        "-color_primaries", str(meta.get("primaries", "bt709")),
+        "-color_trc", str(meta.get("transfer", "bt709")),
+        "-colorspace", str(meta.get("matrix", "bt709")),
     ]
+
+
+def _build_color_bsf(codec_norm: str, meta: Dict[str, Any]) -> str | None:
+    """
+    Build a bitstream metadata filter that fills missing VUI color fields.
+    Applied only for HEVC and only when we inferred unknown source tags.
+    """
+    if codec_norm != "h265":
+        return None
+    if not bool(meta.get("filled_unknown")):
+        return None
+
+    prim_map = {
+        "bt709": 1,
+        "bt470bg": 5,
+        "smpte170m": 6,
+        "smpte240m": 7,
+        "film": 8,
+        "bt2020": 9,
+    }
+    tr_map = {
+        "bt709": 1,
+        "gamma22": 4,
+        "gamma28": 5,
+        "smpte170m": 6,
+        "smpte240m": 7,
+        "linear": 8,
+        "log": 9,
+        "log_sqrt": 10,
+        "iec61966-2-4": 11,
+        "bt1361e": 12,
+        "iec61966-2-1": 13,
+        "bt2020-10": 14,
+        "bt2020-12": 15,
+        "smpte2084": 16,
+        "smpte428": 17,
+        "arib-std-b67": 18,
+    }
+    mat_map = {
+        "rgb": 0,
+        "bt709": 1,
+        "fcc": 4,
+        "bt470bg": 5,
+        "smpte170m": 6,
+        "smpte240m": 7,
+        "ycgco": 8,
+        "bt2020nc": 9,
+        "bt2020c": 10,
+    }
+
+    range_code = 1 if str(meta.get("range", "tv")).lower() == "pc" else 0
+    prim_code = prim_map.get(str(meta.get("primaries", "")).lower())
+    tr_code = tr_map.get(str(meta.get("transfer", "")).lower())
+    mat_code = mat_map.get(str(meta.get("matrix", "")).lower())
+    if prim_code is None or tr_code is None or mat_code is None:
+        return None
+
+    return (
+        "hevc_metadata="
+        f"video_full_range_flag={range_code}:"
+        f"colour_primaries={prim_code}:"
+        f"transfer_characteristics={tr_code}:"
+        f"matrix_coefficients={mat_code}"
+    )
 
 
 def _build_ssim_filter_chain(raw_fr: float | None) -> str:
@@ -472,17 +537,19 @@ def encode_baseline(
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
 
-    codec_norm = _normalize_video_codec(video_codec)
-    nvenc_encoder = _nvenc_encoder_for(codec_norm)
-    cpu_encoder = _cpu_encoder_for(codec_norm)
+    codec_norm = normalize_video_codec(video_codec)
+    nvenc_encoder = nvenc_encoder_for(codec_norm)
+    cpu_encoder = cpu_encoder_for(codec_norm)
     if low_res:
         logging.info("Low-resolution source detected → baseline via %s (QP=%d).", nvenc_encoder, qp)
     else:
         logging.info("High-resolution source → baseline via %s (QP=%d).", nvenc_encoder, qp)
 
     hdr_info = detect_hdr(input_file)
+    color_meta = _build_resolved_color_meta(hdr_info)
     source_vinfo = probe_video_stream_info(input_file)
     source_pix_fmt = str(source_vinfo.get("pix_fmt", "") or "")
+    bsf_filter: str | None = None
     if codec_norm == "h264":
         hdr_filter = build_hdr_sdr_filter(hdr_info)
         tag_filter = _build_bt709_tag_filter()
@@ -497,7 +564,8 @@ def encode_baseline(
     else:
         filter_chain = extra_vf
         pix_fmt = 'p010le' if _is_10bit_pix_fmt(source_pix_fmt) else 'yuv420p'
-        format_args = ['-pix_fmt', pix_fmt] + _build_source_color_args(hdr_info)
+        format_args = ['-pix_fmt', pix_fmt] + _build_color_args_from_meta(color_meta)
+        bsf_filter = _build_color_bsf(codec_norm, color_meta)
 
     # Base command: map only v/a/s, ignore data/tmcd/etc.
     base_cmd = [
@@ -526,6 +594,8 @@ def encode_baseline(
 
     # GPU baseline (force NVENC even for low-res per user request)
     cmd = base_cmd + nvenc_opts
+    if bsf_filter:
+        cmd += ['-bsf:v', bsf_filter]
     cmd += [
         '-c:a', 'copy',
         '-c:s', 'copy',
@@ -540,6 +610,10 @@ def encode_baseline(
             '-c:v', cpu_encoder,
             '-preset', 'veryslow',
             '-qp', str(qp),
+        ]
+        if bsf_filter:
+            cpu_cmd += ['-bsf:v', bsf_filter]
+        cpu_cmd += [
             '-c:a', 'copy',
             '-c:s', 'copy',
             output
@@ -586,9 +660,10 @@ def encode_final(
         ext = ".mkv"
     total_duration = probe_video_duration(input_file)
     low_res = _is_low_res(input_file)
-    codec_norm = _normalize_video_codec(video_codec)
-    nvenc_encoder = _nvenc_encoder_for(codec_norm)
+    codec_norm = normalize_video_codec(video_codec)
+    nvenc_encoder = nvenc_encoder_for(codec_norm)
     hdr_info = detect_hdr(input_file)
+    color_meta = _build_resolved_color_meta(hdr_info)
     source_vinfo = probe_video_stream_info(input_file)
     source_pix_fmt = str(source_vinfo.get("pix_fmt", "") or "")
 
@@ -596,7 +671,7 @@ def encode_final(
     resolution = output_resolution_label or _get_resolution_label(input_file)
     fps_int = int(round(raw_fr))
     
-    encoder_tag = _output_codec_tag(codec_norm)
+    encoder_tag = output_codec_tag(codec_norm)
     # New format: [codec resolution qp XX].source.ext
     filename = f"{base} [{encoder_tag} {resolution}{fps_int} qp {qp}].source{ext}"
     if output_dir:
@@ -607,6 +682,7 @@ def encode_final(
 
     vf_opts: list[str] = []
     color_opts: list[str] = []
+    bsf_opts: list[str] = []
     pix_fmt = "yuv420p"
     if codec_norm == "h264":
         filter_chain = _merge_filters(extra_vf, _build_bt709_tag_filter())
@@ -622,7 +698,10 @@ def encode_final(
         if extra_vf:
             vf_opts = ['-vf', extra_vf]
         pix_fmt = 'p010le' if _is_10bit_pix_fmt(source_pix_fmt) else 'yuv420p'
-        color_opts = _build_source_color_args(hdr_info)
+        color_opts = _build_color_args_from_meta(color_meta)
+        bsf_filter = _build_color_bsf(codec_norm, color_meta)
+        if bsf_filter:
+            bsf_opts = ['-bsf:v', bsf_filter]
 
     common_opts = [
         '-map', '0:v',
@@ -648,7 +727,7 @@ def encode_final(
         '-preset', 'p7',
         '-rc', 'constqp',
         '-qp', str(qp),
-    ] + audio_opts + ['-c:s', 'copy', output]
+    ] + audio_opts + bsf_opts + ['-c:s', 'copy', output]
     run_ffmpeg_progress(cmd, total_duration, desc=f"Final File Encode (QP={qp})")
 
     if return_ssim:

@@ -35,6 +35,9 @@ from .utils import (
     run_ffmpeg_progress,
     setup_logging,
     has_filter,
+    normalize_video_codec,
+    nvenc_encoder_for,
+    nvenc_pix_fmt_for,
 )
 from .sampling import extract_samples, extract_sample_segments
 from .ssim_search import find_best_qp, measure_ssim, measure_ssim_values
@@ -71,12 +74,11 @@ _VIDEO_EXTENSIONS = {
     ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts",
 }
 
-
-def _normalize_video_codec(video_codec: str) -> str:
-    codec = (video_codec or "h264").lower()
-    if codec == "hevc":
-        return "h265"
-    return codec
+_QP_FOR_TIER: Dict[str, int] = {"ultra": 9, "high": 13, "medium": 21, "low": 25}
+_SSIM_FLAT_VELOCITY_FLOOR = 0.00008
+_SSIM_FLAT_CUMULATIVE_DROP = 0.0008
+_SSIM_FLAT_RANGE = 0.0005
+_SSIM_FULL_DISCREPANCY_THRESHOLD = 0.02
 
 
 def _print_h264_problems(problems: list[str]) -> None:
@@ -116,7 +118,7 @@ def _safe_get_file_size(path: str) -> int:
 def _print_source_profile(input_path: str) -> None:
     file_size = _safe_get_file_size(input_path)
     vinfo = probe_video_stream_info(input_path)
-    codec = _normalize_video_codec(probe_video_codec(input_path) or "unknown")
+    codec = normalize_video_codec(probe_video_codec(input_path) or "unknown")
     fps = probe_video_framerate(input_path)
     duration = probe_video_duration(input_path)
     pix_fmt = str(vinfo.get("pix_fmt", "") or "unknown")
@@ -281,8 +283,8 @@ def _determine_baseline_file(
                 print("Video filters require baseline generation; disabling --skip-baseline.")
                 skip_baseline = False
         if skip_baseline:
-            src_codec = _normalize_video_codec(probe_video_codec(input_path))
-            target_codec = _normalize_video_codec(video_codec)
+            src_codec = normalize_video_codec(probe_video_codec(input_path))
+            target_codec = normalize_video_codec(video_codec)
             if skip_baseline_requested:
                 if src_codec != "h265":
                     print(
@@ -309,6 +311,7 @@ def _determine_baseline_file(
         video_codec=video_codec,
     )
     print(f"Baseline file created: {baseline_file}")
+    logging.info("Baseline file created: %s", baseline_file)
     return baseline_file
 
 
@@ -323,7 +326,7 @@ def _maybe_enable_default_skip_baseline(
         return
     if args.use_baseline_as_source:
         return
-    src_codec = _normalize_video_codec(probe_video_codec(input_path))
+    src_codec = normalize_video_codec(probe_video_codec(input_path))
     if src_codec == "h265":
         args.skip_baseline = True
         print("Skipping baseline generation by default for h265/hevc source.")
@@ -726,6 +729,7 @@ def _maybe_run_audio_only_path(args: argparse.Namespace) -> bool:
     scratch_root = _resolve_scratch_root(args.scratch_dir)
     tmpdir = tempfile.mkdtemp(prefix="audio_copy_", dir=scratch_root)
     print(f"Scratch directory: {scratch_root}")
+    logging.info("Scratch directory: %s", scratch_root)
     try:
         output_path = _run_audio_only_copy_video(
             input_path=args.input,
@@ -737,6 +741,7 @@ def _maybe_run_audio_only_path(args: argparse.Namespace) -> bool:
         dest = os.path.join(os.path.dirname(args.input), dest_name)
         shutil.move(output_path, dest)
         print(f"Output file created: {dest}")
+        logging.info("Output file created: %s", dest)
         return True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -851,6 +856,7 @@ def _prepare_work_dirs(
     baseline_tmp = tempfile.mkdtemp(prefix="ssim_baseline_", dir=scratch_root)
     tmpdir = tempfile.mkdtemp(prefix="ssim_final_", dir=scratch_root)
     print(f"Scratch directory: {scratch_root}")
+    logging.info("Scratch directory: %s", scratch_root)
     return baseline_tmp, tmpdir, None
 
 
@@ -874,15 +880,6 @@ def _estimate_full_size_from_samples(sample_bytes: int, percent: float) -> int:
     return int(sample_bytes * (100.0 / percent))
 
 
-def _nvenc_encoder_for(video_codec: str) -> str:
-    codec = _normalize_video_codec(video_codec)
-    return "hevc_nvenc" if codec == "h265" else "h264_nvenc"
-
-
-def _nvenc_pix_fmt_for(video_codec: str) -> str:
-    codec = _normalize_video_codec(video_codec)
-    return "p010le" if codec == "h265" else "yuv420p"
-
 
 def _encode_samples_for_qp(
     segments: list[str],
@@ -898,8 +895,8 @@ def _encode_samples_for_qp(
 
     tmpdir = tempfile.mkdtemp(prefix=f"size_qp{qp}_", dir=tmp_root)
     total_bytes = 0
-    nvenc_encoder = _nvenc_encoder_for(video_codec)
-    pix_fmt = _nvenc_pix_fmt_for(video_codec)
+    nvenc_encoder = nvenc_encoder_for(video_codec)
+    pix_fmt = nvenc_pix_fmt_for(video_codec)
     try:
         for idx, seg in enumerate(segments):
             ext = os.path.splitext(seg)[1]
@@ -1340,6 +1337,7 @@ def _select_best_qp(
     is_source_ref = _same_file(baseline_file, source_ref_path)
     ref_label = "source" if is_source_ref else "baseline"
     print(f"Starting sample SSIM checks against {ref_label}...")
+    logging.info("Starting sample SSIM checks against %s", ref_label)
     best_qp = find_best_qp(
         samples=samples,
         min_qp=args.min_qp,
@@ -1464,6 +1462,7 @@ def _encode_with_full_ssim(
         ssim_rounded = round(ssim_val_opt, 4)
         if ssim_rounded >= target_ssim:
             print(f"  ✓ Meets target SSIM ≥ {target_ssim}; accepting QP={qp}")
+            logging.info("Accepted QP=%d (SSIM=%.4f >= %.4f)", qp, ssim_val_opt, target_ssim)
             return output_path_str, qp, ssim_val_opt
 
         print("  ✗ Below target; trying lower QP...")
@@ -1698,7 +1697,7 @@ def _resolve_target_bytes(
 
 
 def _tier_for_bppf(codec: str, bppf: float) -> str:
-    c = _normalize_video_codec(codec)
+    c = normalize_video_codec(codec)
     if c == "h265":
         if bppf >= 0.120:
             return "ultra"
@@ -1740,7 +1739,7 @@ def _compute_source_advice(
         size_bytes = os.path.getsize(input_path)
     except OSError:
         size_bytes = 0
-    src_codec = _normalize_video_codec(probe_video_codec(input_path))
+    src_codec = normalize_video_codec(probe_video_codec(input_path))
     stream_br = probe_video_bitrate(input_path)
     avg_br = int((size_bytes * 8) / duration) if duration > 0 and size_bytes > 0 else 0
     bitrate_bps = stream_br if stream_br and stream_br > 0 else avg_br
@@ -1889,14 +1888,7 @@ def _ensure_source_quality_for_default_pipeline(args: argparse.Namespace) -> boo
 
 def _quality_label_to_qp(label: str) -> int | None:
     key = label.strip().lower().replace("_", "-").replace(" ", "-")
-    mapping = {
-        # Canonical tiers
-        "ultra": 9,
-        "high": 13,
-        "medium": 21,
-        "low": 25,
-    }
-    return mapping.get(key)
+    return _QP_FOR_TIER.get(key)
 
 
 def _resolve_expected_start_qp(args: argparse.Namespace) -> int:
@@ -2057,9 +2049,9 @@ def _suggest_expected_qps(
     knee_ratio: float,
     use_raw_metric: bool = False,
 ) -> tuple[int, int]:
-    flat_drop_per_100mb_threshold = 0.00008
-    flat_cumulative_drop_threshold = 0.0008
-    flat_range_threshold = 0.0005
+    flat_drop_per_100mb_threshold = _SSIM_FLAT_VELOCITY_FLOOR
+    flat_cumulative_drop_threshold = _SSIM_FLAT_CUMULATIVE_DROP
+    flat_range_threshold = _SSIM_FLAT_RANGE
 
     if len(rows) <= 1:
         qp = rows[0]["qp"]
@@ -2086,6 +2078,20 @@ def _suggest_expected_qps(
         for i in range(1, len(rows))
     )
     median_drop_per_100mb = median(drop_per_100mb_values) if drop_per_100mb_values else 0.0
+    if (
+        use_raw_metric
+        and cumulative_drop <= flat_cumulative_drop_threshold
+        and median_drop_per_100mb <= flat_drop_per_100mb_threshold
+    ):
+        safe_qp = rows[-2]["qp"]
+        balanced_qp = rows[-1]["qp"]
+        print(
+            "Expected-QP: non-degrading raw SSIM ladder detected "
+            f"(range={metric_range:.6f}, cumulative_drop={cumulative_drop:.6f}, "
+            f"median_drop_per_100mb={median_drop_per_100mb:.6f}); "
+            f"preferring higher-QP tail ({safe_qp}/{balanced_qp})."
+        )
+        return safe_qp, balanced_qp
     flat_ladder = (
         metric_range <= flat_range_threshold
         and cumulative_drop <= flat_cumulative_drop_threshold
@@ -2111,7 +2117,7 @@ def _suggest_expected_qps(
     # This is more robust than single-step ratio checks on noisy sample ladders.
     knee_index = None
     window = 2
-    velocity_floor = 0.00008
+    velocity_floor = _SSIM_FLAT_VELOCITY_FLOOR
     if len(valid) >= window * 2:
         idxs = [t[0] for t in valid]
         vels = [t[2] for t in valid]
@@ -2295,10 +2301,13 @@ def _run_expected_qp_mode(
         if current_max_qp >= max_qp_hard:
             print(f"Adaptive ladder stop: reached hard QP cap ({max_qp_hard}).")
         else:
-            adaptive_max_qp = min(max_qp_hard, current_max_qp + 6)
+            if args.expected_eval == "sample":
+                adaptive_max_qp = max_qp_hard
+            else:
+                adaptive_max_qp = min(max_qp_hard, current_max_qp + 6)
             print(f"Adaptive ladder extending: QP {current_max_qp + 1}..{adaptive_max_qp}")
             if args.expected_eval == "sample":
-                rows = _build_expected_rows_sample(
+                rows = _extend_expected_rows_sample_raw(
                     args=args,
                     baseline_file=baseline_file,
                     raw_fr=raw_fr,
@@ -2306,7 +2315,8 @@ def _run_expected_qp_mode(
                     audio_opts=audio_opts,
                     video_codec=video_codec,
                     scratch_root=scratch_root,
-                    start_qp=start_qp,
+                    rows=rows,
+                    start_qp=current_max_qp + 1,
                     max_qp=adaptive_max_qp,
                 )
             else:
@@ -2457,6 +2467,65 @@ def _build_expected_rows_sample(
                 f"raw_avg={sample_metric:.6f}, effective={effective_metric:.6f}"
             )
             print(tqdm_msg)
+            _print_expected_step_progress(rows, estimate=True)
+    finally:
+        if segments_tmpdir:
+            shutil.rmtree(segments_tmpdir, ignore_errors=True)
+    return rows
+
+
+def _extend_expected_rows_sample_raw(
+    args: argparse.Namespace,
+    baseline_file: str,
+    raw_fr: float,
+    gop: int,
+    audio_opts: List[str],
+    video_codec: str,
+    scratch_root: str,
+    rows: List[Dict[str, Any]],
+    start_qp: int,
+    max_qp: int,
+) -> List[Dict[str, Any]]:
+    if start_qp > max_qp:
+        return rows
+    segments, segments_tmpdir = _prepare_size_segments(
+        baseline_file=baseline_file,
+        args=args,
+        scratch_root=scratch_root,
+    )
+    if not segments:
+        raise RuntimeError("Adaptive expected-QP sample extension could not extract sample segments.")
+    try:
+        for qp in range(start_qp, max_qp + 1):
+            sample_vals = measure_ssim_values(
+                qp=qp,
+                samples=segments,
+                raw_fr=raw_fr,
+                gop=gop,
+                audio_opts=audio_opts,
+                video_codec=video_codec,
+            )
+            sample_metric = mean(sample_vals) if sample_vals else 0.0
+            sample_bytes = _encode_samples_for_qp(
+                segments=segments,
+                qp=qp,
+                audio_opts=audio_opts,
+                raw_fr=raw_fr,
+                gop=gop,
+                tmp_root=scratch_root,
+                video_codec=video_codec,
+            )
+            size_bytes = _estimate_full_size_from_samples(sample_bytes, args.sample_percent)
+            rows.append({
+                "qp": qp,
+                "ssim": float(sample_metric),
+                "raw_ssim": float(sample_metric),
+                "size_bytes": int(size_bytes),
+            })
+            print(
+                f"Expected-QP adaptive metric at QP={qp}: "
+                f"raw_avg={sample_metric:.6f}, effective(raw-regime)={sample_metric:.6f}"
+            )
             _print_expected_step_progress(rows, estimate=True)
     finally:
         if segments_tmpdir:
@@ -2728,14 +2797,13 @@ def _maybe_rerun_full_ssim(
         metric=args.metric,
         video_codec=video_codec,
     )
-    discrepancy_threshold = 0.02
     rerun_qp = _prompt_initial_qp_rerun(
         sample_metric=sample_metric,
         full_metric=final_full_ssim,
         final_qp=final_qp,
         min_qp=args.min_qp,
         max_qp=args.max_qp,
-        threshold=discrepancy_threshold,
+        threshold=_SSIM_FULL_DISCREPANCY_THRESHOLD,
     )
     if rerun_qp is None:
         return None, None, None
@@ -2930,11 +2998,13 @@ def _run_transcode_pipeline(
 
         shutil.move(final_path, dest)
         print(f"Optimized file: {dest} (QP={final_qp})")
+        logging.info("Optimized file: %s (QP=%s)", dest, final_qp)
         for extra_path in extra_final_files:
             extra_name = os.path.basename(extra_path)
             extra_dest = os.path.join(os.path.dirname(args.input), extra_name)
             shutil.move(extra_path, extra_dest)
             print(f"Additional output: {extra_dest}")
+            logging.info("Additional output: %s", extra_dest)
         return dest, int(final_qp)
 
     finally:
@@ -2968,7 +3038,7 @@ def _build_batch_profile(path: str) -> Dict[str, Any] | None:
         width = int(vinfo.get("width", 0) or 0)
         height = int(vinfo.get("height", 0) or 0)
         pix_fmt = str(vinfo.get("pix_fmt", "") or "unknown")
-        codec = _normalize_video_codec(probe_video_codec(path) or "unknown")
+        codec = normalize_video_codec(probe_video_codec(path) or "unknown")
         fps = float(probe_video_framerate(path) or 0.0)
         hdr_info = detect_hdr(path)
         is_hdr = bool(hdr_info.get("is_hdr"))
@@ -3189,7 +3259,7 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         print("No readable video profiles found.")
         return
 
-    target_codec = _normalize_video_codec(args.video_codec)
+    target_codec = normalize_video_codec(args.video_codec)
     included: list[Dict[str, Any]] = []
     excluded: list[Dict[str, Any]] = []
     for p in profiles:
@@ -3281,7 +3351,7 @@ def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
     args.skip_baseline_requested = bool(args.skip_baseline)
-    args.video_codec = _normalize_video_codec(args.video_codec)
+    args.video_codec = normalize_video_codec(args.video_codec)
 
     # ------------------------------------------------------------
     # Logging setup

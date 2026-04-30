@@ -5,24 +5,9 @@ import subprocess
 from statistics import mean
 from typing import List, Sequence, Tuple
 
-from .utils import run_cmd
+from .utils import run_cmd, nvenc_encoder_for, nvenc_pix_fmt_for
 
 from tqdm import tqdm
-
-
-def _normalize_video_codec(video_codec: str) -> str:
-    codec = (video_codec or "h264").lower()
-    if codec == "hevc":
-        return "h265"
-    return codec
-
-
-def _nvenc_encoder_for(video_codec: str) -> str:
-    return "hevc_nvenc" if _normalize_video_codec(video_codec) == "h265" else "h264_nvenc"
-
-
-def _nvenc_pix_fmt_for(video_codec: str) -> str:
-    return "p010le" if _normalize_video_codec(video_codec) == "h265" else "yuv420p"
 
 
 def measure_ssim_on_sample(
@@ -67,8 +52,8 @@ def _encode_sample(
     audio_opts: List[str],
     video_codec: str = "h264",
 ) -> bool:
-    nvenc_encoder = _nvenc_encoder_for(video_codec)
-    pix_fmt = _nvenc_pix_fmt_for(video_codec)
+    nvenc_encoder = nvenc_encoder_for(video_codec)
+    pix_fmt = nvenc_pix_fmt_for(video_codec)
     try:
         run_cmd([
             'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', sample_file,

@@ -1,40 +1,16 @@
 # sampling.py
 import os
+import shutil
 import tempfile
-from pathlib import Path
 from typing import List
 
 from .probes import probe_video_duration
-from .utils import run_cmd
+from .utils import run_cmd, nvenc_encoder_for, nvenc_pix_fmt_for
 
 from tqdm import tqdm
 
-def _normalize_video_codec(video_codec: str) -> str:
-    codec = (video_codec or "h264").lower()
-    if codec == "hevc":
-        return "h265"
-    return codec
-
-
-def _nvenc_encoder_for(video_codec: str) -> str:
-    return "hevc_nvenc" if _normalize_video_codec(video_codec) == "h265" else "h264_nvenc"
-
-
-def _nvenc_pix_fmt_for(video_codec: str) -> str:
-    return "p010le" if _normalize_video_codec(video_codec) == "h265" else "yuv420p"
-
-
-def make_safe_symlink(input_file: str) -> str:
-    """
-    Create a temp symlink to `input_file` in a dir with a safe filename.
-    Returns the symlink path.
-    """
-    tmpdir = tempfile.mkdtemp(prefix="ssim_safe_")
-    ext = Path(input_file).suffix
-    safe_name = f"video{ext}"
-    link_path = Path(tmpdir) / safe_name
-    os.symlink(input_file, link_path)
-    return str(link_path)
+_SCENE_CHANGE_THRESHOLD = 0.30
+_MOTION_CHANGE_THRESHOLD = 0.10
 
 
 def _detect_scene_times(input_file: str, threshold: float) -> list[float]:
@@ -115,9 +91,9 @@ def _resolve_clip_len(clip_len: float | None, span: float, count: int) -> float:
 
 def _scene_threshold_for_mode(sampling_mode: str) -> float | None:
     if sampling_mode == 'scene':
-        return 0.30
+        return _SCENE_CHANGE_THRESHOLD
     if sampling_mode == 'motion':
-        return 0.10
+        return _MOTION_CHANGE_THRESHOLD
     return None
 
 
@@ -265,34 +241,38 @@ def extract_samples(
 
     tmpdir = tempfile.mkdtemp(prefix="ssim_sample_", dir=tmp_root)
     samples: list[str] = []
-    nvenc_encoder = _nvenc_encoder_for(video_codec)
-    pix_fmt = _nvenc_pix_fmt_for(video_codec)
+    nvenc_encoder = nvenc_encoder_for(video_codec)
+    pix_fmt = nvenc_pix_fmt_for(video_codec)
 
-    for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
-        ext = os.path.splitext(input_file)[1]
-        seg = os.path.join(tmpdir, f"seg_{idx}{ext}")
-        sample_file = os.path.join(tmpdir, f"sample_{idx}{ext}")
+    try:
+        for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
+            ext = os.path.splitext(input_file)[1]
+            seg = os.path.join(tmpdir, f"seg_{idx}{ext}")
+            sample_file = os.path.join(tmpdir, f"sample_{idx}{ext}")
 
-        # Extract the sample segment
-        run_cmd([
-            'ffmpeg', '-y',
-            '-ss', str(t),
-            '-i', input_file,
-            '-t', str(clip_len),
-            '-c', 'copy',
-            seg
-        ])
+            # Extract the sample segment
+            run_cmd([
+                'ffmpeg', '-y',
+                '-ss', str(t),
+                '-i', input_file,
+                '-t', str(clip_len),
+                '-c', 'copy',
+                seg
+            ])
 
-        # Encode sample with explicit stream mapping
-        run_cmd([
-            'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', seg,
-            '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
-            '-r', str(raw_fr), '-g', str(int(max(1, round(raw_fr / 2)))),
-            '-bf', '2', '-pix_fmt', pix_fmt, '-c:v', nvenc_encoder,
-            '-preset', 'p7', '-rc', 'constqp', '-qp', str(sample_qp)
-        ] + audio_opts + ['-c:s', 'copy', sample_file])
+            # Encode sample with explicit stream mapping
+            run_cmd([
+                'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', seg,
+                '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
+                '-r', str(raw_fr), '-g', str(int(max(1, round(raw_fr / 2)))),
+                '-bf', '2', '-pix_fmt', pix_fmt, '-c:v', nvenc_encoder,
+                '-preset', 'p7', '-rc', 'constqp', '-qp', str(sample_qp)
+            ] + audio_opts + ['-c:s', 'copy', sample_file])
 
-        samples.append(sample_file)
+            samples.append(sample_file)
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
 
     return samples, tmpdir
 
@@ -329,16 +309,20 @@ def extract_sample_segments(
     segments: list[str] = []
     ext = os.path.splitext(input_file)[1]
 
-    for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
-        seg = os.path.join(tmpdir, f"seg_{idx}{ext}")
-        run_cmd([
-            'ffmpeg', '-y',
-            '-ss', str(t),
-            '-i', input_file,
-            '-t', str(clip_len),
-            '-c', 'copy',
-            seg
-        ])
-        segments.append(seg)
+    try:
+        for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
+            seg = os.path.join(tmpdir, f"seg_{idx}{ext}")
+            run_cmd([
+                'ffmpeg', '-y',
+                '-ss', str(t),
+                '-i', input_file,
+                '-t', str(clip_len),
+                '-c', 'copy',
+                seg
+            ])
+            segments.append(seg)
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
 
     return segments, tmpdir, clip_len, duration

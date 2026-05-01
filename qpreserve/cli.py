@@ -75,10 +75,19 @@ _VIDEO_EXTENSIONS = {
 }
 
 _QP_FOR_TIER: Dict[str, int] = {"ultra": 9, "high": 13, "medium": 21, "low": 25}
+_TIER_ORDER = ["ultra", "high", "medium", "low"]
 _SSIM_FLAT_VELOCITY_FLOOR = 0.00008
 _SSIM_FLAT_CUMULATIVE_DROP = 0.0008
 _SSIM_FLAT_RANGE = 0.0005
 _SSIM_FULL_DISCREPANCY_THRESHOLD = 0.02
+
+
+class BatchOutputLargerThanSourceError(Exception):
+    """Raised by the expected-QP pipeline when the ladder predicts output > source.
+
+    Caught by batch mode to retry the cluster representative at a lower quality tier
+    without wasting time on a final encode that is already known to be too large.
+    """
 
 
 def _print_h264_problems(problems: list[str]) -> None:
@@ -1716,6 +1725,15 @@ def _tier_for_bppf(codec: str, bppf: float) -> str:
     return "low"
 
 
+def _next_lower_tier(tier: str) -> str | None:
+    """Return the next lower quality tier, or None if already at the lowest."""
+    try:
+        idx = _TIER_ORDER.index(tier.lower())
+    except ValueError:
+        return None
+    return _TIER_ORDER[idx + 1] if idx + 1 < len(_TIER_ORDER) else None
+
+
 def _selected_quality_label(args: argparse.Namespace) -> str | None:
     if not args.source_quality:
         return None
@@ -2367,6 +2385,20 @@ def _run_expected_qp_mode(
         f"Expected-QP mode suggestions: safe={safe_qp}, balanced={balanced_qp}. "
         f"Selected QP(s)={selected_qps}."
     )
+
+    # In batch mode with a heuristic tier, check the ladder estimate before encoding.
+    # If the selected QP already predicts an output larger than the source, bail out
+    # early so the caller can retry with a lower tier without wasting a full encode.
+    batch_size_limit: int | None = getattr(args, "batch_heuristic_size_limit", None)
+    if batch_size_limit is not None:
+        selected_row = next((r for r in rows if r["qp"] == selected_qp), None)
+        if selected_row is not None:
+            est_size = int(selected_row.get("size_bytes", 0))
+            if est_size > batch_size_limit:
+                raise BatchOutputLargerThanSourceError(
+                    f"estimated {est_size / 1e6:.1f} MB > source "
+                    f"{batch_size_limit / 1e6:.1f} MB at QP={selected_qp}"
+                )
 
     extra_paths: list[str] = []
     if args.expected_eval == "sample":
@@ -3303,19 +3335,55 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         rep_path = str(rep["path"])
         print(f"\n[Cluster {cluster['id']}] Sampling representative: {rep_path}")
 
-        rep_args = argparse.Namespace(**vars(args))
-        rep_args.input = rep_path
-        if not rep_args.source_quality:
-            advised = _tier_for_bppf(str(rep["codec"]), float(rep["bppf"]))
-            rep_args.source_quality = advised
-            print(
-                f"[Cluster {cluster['id']}] No --source-quality provided; "
-                f"using heuristic tier '{advised}' for representative."
-            )
-        try:
-            _dest, cluster_qp = _run_single_file_pipeline(rep_args)
-        except Exception as exc:
-            print(f"[Cluster {cluster['id']}] ERROR: representative failed: {exc}")
+        # Track whether the tier was auto-detected so we know whether to retry.
+        heuristic_tier = not bool(args.source_quality)
+        initial_tier = (
+            _tier_for_bppf(str(rep["codec"]), float(rep["bppf"]))
+            if heuristic_tier
+            else str(args.source_quality)
+        )
+
+        cluster_dest: str | None = None
+        cluster_qp: int | None = None
+        current_tier = initial_tier
+
+        while True:
+            rep_args = argparse.Namespace(**vars(args))
+            rep_args.input = rep_path
+            rep_args.source_quality = current_tier
+            if heuristic_tier:
+                print(
+                    f"[Cluster {cluster['id']}] No --source-quality provided; "
+                    f"using heuristic tier '{current_tier}' for representative."
+                )
+                # Pass source size to the pipeline only when a lower tier exists.
+                # When already at 'low', skip the check so the encode runs regardless.
+                if _next_lower_tier(current_tier) is not None:
+                    try:
+                        rep_args.batch_heuristic_size_limit = os.path.getsize(rep_path)
+                    except OSError:
+                        pass
+
+            try:
+                cluster_dest, cluster_qp = _run_single_file_pipeline(rep_args)
+            except BatchOutputLargerThanSourceError as exc:
+                next_tier = _next_lower_tier(current_tier)
+                # next_tier is always non-None here because we only set the size limit
+                # when a lower tier exists (see above).
+                print(
+                    f"[Cluster {cluster['id']}] {exc}; "
+                    f"retrying at lower tier '{next_tier}'."
+                )
+                current_tier = next_tier  # type: ignore[assignment]
+                continue
+            except Exception as exc:
+                print(f"[Cluster {cluster['id']}] ERROR: representative failed: {exc}")
+                cluster_dest = None
+                cluster_qp = None
+                break
+            break
+
+        if cluster_dest is None or cluster_qp is None:
             continue
         processed += 1
         print(f"[Cluster {cluster['id']}] Learned QP={cluster_qp}. Applying to peers.")

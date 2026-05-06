@@ -56,7 +56,7 @@ def _encode_sample(
     pix_fmt = nvenc_pix_fmt_for(video_codec)
     try:
         run_cmd([
-            'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', sample_file,
+            'ffmpeg', '-y', '-hwaccel', 'cuda', '-fflags', '+discardcorrupt', '-i', sample_file,
             '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
             '-r', str(raw_fr), '-g', str(gop), '-bf', '2', '-pix_fmt', pix_fmt,
             '-c:v', nvenc_encoder, '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)

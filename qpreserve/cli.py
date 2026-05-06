@@ -31,6 +31,7 @@ from .probes import (
 )
 from .utils import (
     build_audio_options,
+    check_output_filename_length,
     run_cmd,
     run_ffmpeg_progress,
     setup_logging,
@@ -38,6 +39,7 @@ from .utils import (
     normalize_video_codec,
     nvenc_encoder_for,
     nvenc_pix_fmt_for,
+    output_codec_tag,
 )
 from .sampling import extract_samples, extract_sample_segments
 from .ssim_search import find_best_qp, measure_ssim, measure_ssim_values
@@ -88,6 +90,11 @@ class BatchOutputLargerThanSourceError(Exception):
     Caught by batch mode to retry the cluster representative at a lower quality tier
     without wasting time on a final encode that is already known to be too large.
     """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.baseline_file: str | None = None
+        self.baseline_tmp: str | None = None
 
 
 def _print_h264_problems(problems: list[str]) -> None:
@@ -459,6 +466,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Batch mode: print clustering and planned actions without encoding.'
     )
+    parser.add_argument(
+        '--batch-size-guard',
+        action='store_true',
+        help='Batch mode: if the estimated output at the selected quality tier is larger '
+             'than the source, automatically retry with the next lower tier.'
+    )
 
     parser.add_argument(
         '--sampling-mode',
@@ -706,6 +719,7 @@ def _run_audio_only_copy_video(
 
     cmd = [
         'ffmpeg', '-y',
+        '-fflags', '+discardcorrupt',
         '-i', input_path,
         '-map', '0:v?', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
     ] + audio_opts + ['-c:v', 'copy', '-c:s', 'copy', output_path]
@@ -911,7 +925,7 @@ def _encode_samples_for_qp(
             ext = os.path.splitext(seg)[1]
             sample_file = os.path.join(tmpdir, f"sample_{idx}{ext}")
             run_cmd([
-                'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', seg,
+                'ffmpeg', '-y', '-hwaccel', 'cuda', '-fflags', '+discardcorrupt', '-i', seg,
                 '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
                 '-r', str(raw_fr), '-g', str(gop),
                 '-bf', '2', '-pix_fmt', pix_fmt, '-c:v', nvenc_encoder,
@@ -2896,6 +2910,16 @@ def _prepare_main_context(
         height=height,
         raw_fr=source_fr,
     )
+    _stem = os.path.splitext(os.path.basename(args.input))[0]
+    _raw_ext = os.path.splitext(args.input)[1].lower()
+    _out_ext = _raw_ext if _raw_ext == ".mp4" else ".mkv"
+    check_output_filename_length(
+        stem=_stem,
+        out_ext=_out_ext,
+        encoder_tag=output_codec_tag(normalize_video_codec(codec)),
+        resolution_label=f"{min(width, height)}p",
+        fps_int=int(round(raw_fr)),
+    )
     return extra_vf, expected_mode, codec, use_size_target, audio_opts, raw_fr
 
 
@@ -2913,15 +2937,24 @@ def _run_transcode_pipeline(
         scratch_root, args.input, args.skip_baseline
     )
     refine_tmp: str | None = None
+    # When handing off baseline ownership to caller on BatchOutputLargerThanSourceError,
+    # skip deletion of baseline_tmp in finally so the next retry can reuse it.
+    _baseline_tmp_owned = True
+    precomputed_baseline: str | None = getattr(args, "batch_precomputed_baseline_file", None)
+    baseline_file: str = args.input  # safe default; overwritten below before use
 
     try:
-        baseline_file, source_ref_path = _prepare_baseline_and_source(
-            args=args,
-            use_size_target=use_size_target,
-            extra_vf=extra_vf,
-            baseline_tmp=baseline_tmp,
-            video_codec=args.video_codec,
-        )
+        if precomputed_baseline:
+            baseline_file = precomputed_baseline
+            source_ref_path = _resolve_source_ref_path(args, baseline_file)
+        else:
+            baseline_file, source_ref_path = _prepare_baseline_and_source(
+                args=args,
+                use_size_target=use_size_target,
+                extra_vf=extra_vf,
+                baseline_tmp=baseline_tmp,
+                video_codec=args.video_codec,
+            )
         final_extra_vf = extra_vf if _same_file(baseline_file, args.input) else None
         final_resolution_label = (
             str(args.resize_resolution)
@@ -3039,11 +3072,21 @@ def _run_transcode_pipeline(
             logging.info("Additional output: %s", extra_dest)
         return dest, int(final_qp)
 
+    except BatchOutputLargerThanSourceError as exc:
+        # Attach the baseline location so the batch loop can reuse it on the next tier.
+        # Only do this when we created the baseline ourselves (not when we reused one).
+        if not precomputed_baseline:
+            exc.baseline_file = baseline_file
+            exc.baseline_tmp = baseline_tmp
+            _baseline_tmp_owned = False
+        raise
+
     finally:
         if samples_tmpdir:
             shutil.rmtree(samples_tmpdir, ignore_errors=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
-        shutil.rmtree(baseline_tmp, ignore_errors=True)
+        if _baseline_tmp_owned:
+            shutil.rmtree(baseline_tmp, ignore_errors=True)
         if refine_tmp:
             shutil.rmtree(refine_tmp, ignore_errors=True)
 
@@ -3346,19 +3389,24 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         cluster_dest: str | None = None
         cluster_qp: int | None = None
         current_tier = initial_tier
+        # Baseline preserved across tier retries so it is not recreated each time.
+        batch_baseline_file: str | None = None
+        batch_baseline_tmp: str | None = None
 
         while True:
             rep_args = argparse.Namespace(**vars(args))
             rep_args.input = rep_path
             rep_args.source_quality = current_tier
+            if batch_baseline_file:
+                rep_args.batch_precomputed_baseline_file = batch_baseline_file
             if heuristic_tier:
                 print(
                     f"[Cluster {cluster['id']}] No --source-quality provided; "
                     f"using heuristic tier '{current_tier}' for representative."
                 )
-                # Pass source size to the pipeline only when a lower tier exists.
-                # When already at 'low', skip the check so the encode runs regardless.
-                if _next_lower_tier(current_tier) is not None:
+                # Pass source size to the pipeline only when the guard is enabled
+                # and a lower tier exists to fall back to.
+                if args.batch_size_guard and _next_lower_tier(current_tier) is not None:
                     try:
                         rep_args.batch_heuristic_size_limit = os.path.getsize(rep_path)
                     except OSError:
@@ -3374,6 +3422,9 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
                     f"[Cluster {cluster['id']}] {exc}; "
                     f"retrying at lower tier '{next_tier}'."
                 )
+                if exc.baseline_file:
+                    batch_baseline_file = exc.baseline_file
+                    batch_baseline_tmp = exc.baseline_tmp
                 current_tier = next_tier  # type: ignore[assignment]
                 continue
             except Exception as exc:
@@ -3382,6 +3433,9 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
                 cluster_qp = None
                 break
             break
+
+        if batch_baseline_tmp:
+            shutil.rmtree(batch_baseline_tmp, ignore_errors=True)
 
         if cluster_dest is None or cluster_qp is None:
             continue

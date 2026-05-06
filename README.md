@@ -87,6 +87,14 @@ qpreserve /path/to/videos/ --batch-auto
 Treats the input as a directory, clusters similar videos by quality, and encodes one representative per cluster.  
 Add `--batch-dry-run` to preview planned actions without encoding.
 
+If you expect the output to be smaller than the source (e.g. re-encoding old H.264 sources), add `--batch-size-guard` to automatically fall back to a lower quality tier whenever the estimated output would exceed the source file size:
+
+```bash
+qpreserve /path/to/videos/ --batch-auto --batch-size-guard
+```
+
+Note: this guard is intentionally off by default. Transcoding across codecs (e.g. HEVC → H.264) commonly produces a larger output and that is expected behaviour.
+
 ## Options Reference
 
 | Option | Default | Description |
@@ -105,6 +113,7 @@ Add `--batch-dry-run` to preview planned actions without encoding.
 | `--no-full-ssim` | off | Skip full-file SSIM verification (faster, less precise) |
 | `--batch-auto` | off | Directory input: cluster and batch-encode |
 | `--batch-dry-run` | off | Print planned batch actions without encoding |
+| `--batch-size-guard` | off | Retry at a lower quality tier if estimated output exceeds source size |
 | `--log-file` | — | Write log output to a file |
 | `-v` / `--verbose` | off | Enable verbose logging |
 

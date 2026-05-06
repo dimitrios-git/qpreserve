@@ -253,6 +253,7 @@ def extract_samples(
             # Extract the sample segment
             run_cmd([
                 'ffmpeg', '-y',
+                '-fflags', '+discardcorrupt',
                 '-ss', str(t),
                 '-i', input_file,
                 '-t', str(clip_len),
@@ -262,7 +263,7 @@ def extract_samples(
 
             # Encode sample with explicit stream mapping
             run_cmd([
-                'ffmpeg', '-y', '-hwaccel', 'cuda', '-i', seg,
+                'ffmpeg', '-y', '-hwaccel', 'cuda', '-fflags', '+discardcorrupt', '-i', seg,
                 '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
                 '-r', str(raw_fr), '-g', str(int(max(1, round(raw_fr / 2)))),
                 '-bf', '2', '-pix_fmt', pix_fmt, '-c:v', nvenc_encoder,
@@ -314,6 +315,7 @@ def extract_sample_segments(
             seg = os.path.join(tmpdir, f"seg_{idx}{ext}")
             run_cmd([
                 'ffmpeg', '-y',
+                '-fflags', '+discardcorrupt',
                 '-ss', str(t),
                 '-i', input_file,
                 '-t', str(clip_len),

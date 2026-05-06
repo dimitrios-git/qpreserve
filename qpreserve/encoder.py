@@ -570,6 +570,7 @@ def encode_baseline(
     # Base command: map only v/a/s, ignore data/tmcd/etc.
     base_cmd = [
         'ffmpeg', '-y',
+        '-fflags', '+discardcorrupt',
         '-i', input_file,
         '-map', '0:v',
         '-map', '0:a?',
@@ -622,6 +623,21 @@ def encode_baseline(
     return output
 
 
+def _ffmpeg_log_has_audio_filter_failure(log_path: str | None) -> bool:
+    if not log_path:
+        return False
+    try:
+        with open(log_path) as f:
+            content = f.read()
+    except OSError:
+        return False
+    return any(sig in content for sig in (
+        'Error reinitializing filters',
+        'Rematrix is needed',
+        'Failed to configure output pad',
+    ))
+
+
 def encode_final(
     input_file: str,
     qp: int,
@@ -672,8 +688,7 @@ def encode_final(
     fps_int = int(round(raw_fr))
     
     encoder_tag = output_codec_tag(codec_norm)
-    # New format: [codec resolution qp XX].source.ext
-    filename = f"{base} [{encoder_tag} {resolution}{fps_int} qp {qp}].source{ext}"
+    filename = f"{base} [{encoder_tag} {resolution}{fps_int} qp {qp}]{ext}"
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         output = os.path.join(output_dir, filename)
@@ -718,17 +733,32 @@ def encode_final(
     else:
         logging.info("High-resolution baseline → final encode via %s (QP=%d).", nvenc_encoder, qp)
 
-    cmd = [
-        'ffmpeg', '-y',
-        '-hwaccel', 'cuda',
-        '-i', input_file,
-    ] + common_opts + [
+    video_opts = [
         '-c:v', nvenc_encoder,
         '-preset', 'p7',
         '-rc', 'constqp',
         '-qp', str(qp),
-    ] + audio_opts + bsf_opts + ['-c:s', 'copy', output]
-    run_ffmpeg_progress(cmd, total_duration, desc=f"Final File Encode (QP={qp})")
+    ]
+    cmd = [
+        'ffmpeg', '-y',
+        '-hwaccel', 'cuda',
+        '-i', input_file,
+    ] + common_opts + video_opts + audio_opts + bsf_opts + ['-c:s', 'copy', output]
+    try:
+        run_ffmpeg_progress(cmd, total_duration, desc=f"Final File Encode (QP={qp})")
+    except subprocess.CalledProcessError as err:
+        if _ffmpeg_log_has_audio_filter_failure(getattr(err, 'ffmpeg_log', None)):
+            logging.warning(
+                "Audio filter failed (corrupt source audio); retrying with audio copy."
+            )
+            cmd_copy = [
+                'ffmpeg', '-y',
+                '-hwaccel', 'cuda',
+                '-i', input_file,
+            ] + common_opts + video_opts + ['-c:a', 'copy'] + bsf_opts + ['-c:s', 'copy', output]
+            run_ffmpeg_progress(cmd_copy, total_duration, desc=f"Final File Encode (QP={qp}, audio copy)")
+        else:
+            raise
 
     if return_ssim:
         ssim_val = measure_full_ssim(

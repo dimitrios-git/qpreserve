@@ -203,6 +203,33 @@ def output_codec_tag(video_codec: str) -> str:
     return "hevc" if normalize_video_codec(video_codec) == "h265" else "avc"
 
 
+_MAX_FILENAME_BYTES = 255
+
+
+def check_output_filename_length(
+    stem: str,
+    out_ext: str,
+    encoder_tag: str,
+    resolution_label: str,
+    fps_int: int,
+) -> None:
+    """Raise ValueError before encoding if any output filename would exceed 255 bytes.
+
+    Assumes worst-case 2-digit QP, which is accurate in the vast majority of cases.
+    """
+    final_suffix = f" [{encoder_tag} {resolution_label}{fps_int} qp 51]{out_ext}"
+    baseline_suffix = f" [baseline qp 51]{out_ext}"
+    worst_suffix = max(final_suffix, baseline_suffix, key=lambda s: len(s.encode()))
+    total = len(stem.encode()) + len(worst_suffix.encode())
+    if total > _MAX_FILENAME_BYTES:
+        over_by = total - _MAX_FILENAME_BYTES
+        raise ValueError(
+            f"Output filename would be {over_by} byte(s) too long for the filesystem "
+            f"(limit {_MAX_FILENAME_BYTES} bytes). Rename the source file to be at least "
+            f"{over_by} byte(s) shorter and rerun."
+        )
+
+
 # ────────────────────────────────────────────────
 # AUDIO STREAM LOGIC
 # ────────────────────────────────────────────────

@@ -739,11 +739,16 @@ def encode_final(
         '-rc', 'constqp',
         '-qp', str(qp),
     ]
-    cmd = [
-        'ffmpeg', '-y',
-        '-hwaccel', 'cuda',
-        '-i', input_file,
-    ] + common_opts + video_opts + audio_opts + bsf_opts + ['-c:s', 'copy', output]
+    input_opts = [
+        '-fflags', '+discardcorrupt',
+        '-err_detect', 'ignore_err',
+    ]
+    cmd = (
+        ['ffmpeg', '-y', '-hwaccel', 'cuda']
+        + input_opts
+        + ['-i', input_file]
+        + common_opts + video_opts + audio_opts + bsf_opts + ['-c:s', 'copy', output]
+    )
     try:
         run_ffmpeg_progress(cmd, total_duration, desc=f"Final File Encode (QP={qp})")
     except subprocess.CalledProcessError as err:
@@ -751,11 +756,12 @@ def encode_final(
             logging.warning(
                 "Audio filter failed (corrupt source audio); retrying with audio copy."
             )
-            cmd_copy = [
-                'ffmpeg', '-y',
-                '-hwaccel', 'cuda',
-                '-i', input_file,
-            ] + common_opts + video_opts + ['-c:a', 'copy'] + bsf_opts + ['-c:s', 'copy', output]
+            cmd_copy = (
+                ['ffmpeg', '-y', '-hwaccel', 'cuda']
+                + input_opts
+                + ['-i', input_file]
+                + common_opts + video_opts + ['-c:a', 'copy'] + bsf_opts + ['-c:s', 'copy', output]
+            )
             run_ffmpeg_progress(cmd_copy, total_duration, desc=f"Final File Encode (QP={qp}, audio copy)")
         else:
             raise

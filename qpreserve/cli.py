@@ -76,8 +76,8 @@ _VIDEO_EXTENSIONS = {
     ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts",
 }
 
-_QP_FOR_TIER: Dict[str, int] = {"ultra": 9, "high": 13, "medium": 21, "low": 25}
-_TIER_ORDER = ["ultra", "high", "medium", "low"]
+_QP_FOR_TIER: Dict[str, int] = {"ultra": 9, "high": 13, "medium": 21, "low": 25, "lower": 30}
+_TIER_ORDER = ["ultra", "high", "medium", "low", "lower"]
 _SSIM_FLAT_VELOCITY_FLOOR = 0.00008
 _SSIM_FLAT_CUMULATIVE_DROP = 0.0008
 _SSIM_FLAT_RANGE = 0.0005
@@ -402,9 +402,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         '--source-quality',
         type=str,
         help='Starting point for expected-QP mode. Accepts a numeric QP start (e.g. 22) '
-             'or one of: ultra, high, medium, low. If omitted, interactive runs prompt for it '
+             'or one of: ultra, high, medium, low, lower. If omitted, interactive runs prompt for it '
              '(non-interactive defaults to medium). '
-             'Guide: ultra=near-lossless, high=clean, medium=compressed, low=heavily compressed.'
+             'Guide: ultra=near-lossless, high=clean, medium=compressed, low=heavily compressed, lower=very heavily compressed.'
     )
     parser.add_argument(
         '--expected-qp',
@@ -594,6 +594,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              '"prompt" asks when a TTY is available; "force" applies automatically.'
     )
 
+    # Output placement
+    parser.add_argument(
+        '--output-dir',
+        metavar='DIR',
+        default=None,
+        help='Root directory for output files. When used with --batch-auto, the relative path '
+             'of each source file within the input directory is recreated under this directory.'
+    )
+    parser.add_argument(
+        '--no-suffix',
+        action='store_true',
+        default=False,
+        help='Omit the quality/codec suffix from output filenames. '
+             'Only valid when --output-dir is set.'
+    )
+
     return parser
 
 
@@ -706,6 +722,29 @@ def _resolve_target_framerate(source_fr: float, target_fps: float | None) -> flo
     return float(normalized)
 
 
+def _resolve_output_dest(
+    encoded_path: str,
+    source_path: str,
+    output_dir: str | None,
+    no_suffix: bool,
+    batch_input_dir: str | None = None,
+) -> str:
+    dest_name = os.path.basename(encoded_path)
+    if output_dir:
+        if batch_input_dir:
+            rel_dir = os.path.relpath(os.path.dirname(source_path), batch_input_dir)
+            out_subdir = os.path.normpath(os.path.join(output_dir, rel_dir))
+        else:
+            out_subdir = output_dir
+        os.makedirs(out_subdir, exist_ok=True)
+        if no_suffix:
+            _, enc_ext = os.path.splitext(dest_name)
+            src_base = os.path.splitext(os.path.basename(source_path))[0]
+            dest_name = f"{src_base}{enc_ext}"
+        return os.path.join(out_subdir, dest_name)
+    return os.path.join(os.path.dirname(source_path), dest_name)
+
+
 def _run_audio_only_copy_video(
     input_path: str,
     audio_opts: List[str],
@@ -736,6 +775,11 @@ def _run_audio_only_copy_video(
 def _maybe_run_audio_only_path(args: argparse.Namespace) -> bool:
     if not args.add_stereo_downmix_copy_video:
         return False
+    predicted = _predict_output_path(args)
+    if predicted and os.path.exists(predicted):
+        print(f"Skipping (output exists): {predicted}")
+        logging.info("Skipping (output exists): %s", predicted)
+        return True
     args.add_stereo_downmix = True
     normalize_enabled = args.audio_normalize
     if normalize_enabled and not has_filter('loudnorm'):
@@ -760,8 +804,13 @@ def _maybe_run_audio_only_path(args: argparse.Namespace) -> bool:
             output_dir=tmpdir,
         )
 
-        dest_name = os.path.basename(output_path)
-        dest = os.path.join(os.path.dirname(args.input), dest_name)
+        dest = _resolve_output_dest(
+            encoded_path=output_path,
+            source_path=args.input,
+            output_dir=getattr(args, 'output_dir', None),
+            no_suffix=getattr(args, 'no_suffix', False),
+            batch_input_dir=getattr(args, '_batch_input_dir', None),
+        )
         shutil.move(output_path, dest)
         print(f"Output file created: {dest}")
         logging.info("Output file created: %s", dest)
@@ -1728,7 +1777,9 @@ def _tier_for_bppf(codec: str, bppf: float) -> str:
             return "high"
         if bppf >= 0.024:
             return "medium"
-        return "low"
+        if bppf >= 0.012:
+            return "low"
+        return "lower"
     # h264 and other codecs: generally need more bppf for similar perceptual quality.
     if bppf >= 0.200:
         return "ultra"
@@ -1736,7 +1787,9 @@ def _tier_for_bppf(codec: str, bppf: float) -> str:
         return "high"
     if bppf >= 0.060:
         return "medium"
-    return "low"
+    if bppf >= 0.030:
+        return "low"
+    return "lower"
 
 
 def _next_lower_tier(tier: str) -> str | None:
@@ -1807,7 +1860,7 @@ def _maybe_print_expected_mode_advice(
     )
     print(f"Heuristic suggested source-quality tier: {advised}.")
     if selected and selected != advised:
-        tier_rank = {"low": 1, "medium": 2, "high": 3, "ultra": 4}
+        tier_rank = {"lower": 0, "low": 1, "medium": 2, "high": 3, "ultra": 4}
         sel_rank = tier_rank.get(selected, 0)
         adv_rank = tier_rank.get(advised, 0)
         if sel_rank < adv_rank:
@@ -1832,6 +1885,7 @@ def _default_choice_for_tier(tier: str) -> str:
         "high": "2",
         "medium": "3",
         "low": "4",
+        "lower": "5",
     }.get(tier, "3")
 
 
@@ -1841,13 +1895,15 @@ def _print_source_quality_menu(default_choice: str) -> None:
         "2": "high",
         "3": "medium",
         "4": "low",
+        "5": "lower",
     }.get(default_choice, "medium")
     print("Select source quality tier for Expected-QP mode:")
     print(f"  [1] ultra{' (recommended)' if rec_label == 'ultra' else ''}")
     print(f"  [2] high{' (recommended)' if rec_label == 'high' else ''}")
     print(f"  [3] medium{' (recommended)' if rec_label == 'medium' else ''}")
     print(f"  [4] low{' (recommended)' if rec_label == 'low' else ''}")
-    print("  [5] Enter numeric QP")
+    print(f"  [5] lower{' (recommended)' if rec_label == 'lower' else ''}")
+    print("  [6] Enter numeric QP")
     print("  [q] Quit")
     print("Note: recommendation is estimated from bitrate per pixel per frame.")
     print("It is usually accurate, but can be misleading for low-quality sources with inflated bitrate.")
@@ -1859,6 +1915,7 @@ def _resolve_source_quality_choice(default_choice: str) -> str | None:
         "2": "high",
         "3": "medium",
         "4": "low",
+        "5": "lower",
     }
 
     def _prompt_numeric_qp() -> str | None:
@@ -1871,7 +1928,7 @@ def _resolve_source_quality_choice(default_choice: str) -> str | None:
         return raw
 
     while True:
-        choice = input(f"Choose 1-5 or q [{default_choice}]: ").strip().lower()
+        choice = input(f"Choose 1-6 or q [{default_choice}]: ").strip().lower()
         if choice == "":
             choice = default_choice
         if choice in {"q", "quit"}:
@@ -1880,12 +1937,12 @@ def _resolve_source_quality_choice(default_choice: str) -> str | None:
         tier = tier_by_choice.get(choice)
         if tier:
             return tier
-        if choice == "5":
+        if choice == "6":
             raw = _prompt_numeric_qp()
             if raw is None:
                 continue
             return raw
-        print("Please choose 1, 2, 3, 4, 5, or q.")
+        print("Please choose 1, 2, 3, 4, 5, 6, or q.")
 
 
 def _ensure_source_quality_for_default_pipeline(args: argparse.Namespace) -> bool:
@@ -1940,7 +1997,7 @@ def _resolve_expected_start_qp(args: argparse.Namespace) -> int:
             start_qp = int(text)
         except ValueError as exc:
             raise ValueError(
-                "Invalid --source-quality value. Use QP integer or one of: ultra, high, medium, low."
+                "Invalid --source-quality value. Use QP integer or one of: ultra, high, medium, low, lower."
             ) from exc
     if start_qp < args.min_qp:
         print(
@@ -2401,18 +2458,42 @@ def _run_expected_qp_mode(
     )
 
     # In batch mode with a heuristic tier, check the ladder estimate before encoding.
-    # If the selected QP already predicts an output larger than the source, bail out
-    # early so the caller can retry with a lower tier without wasting a full encode.
+    # If the selected QP predicts an output larger than the source, first scan the
+    # already-measured rows for a higher QP that fits — avoiding a full tier-drop
+    # retry that would re-measure all the same QP levels from scratch.
+    # Only raise BatchOutputLargerThanSourceError (triggering a tier drop) when no
+    # row in the current ladder can produce an output small enough.
     batch_size_limit: int | None = getattr(args, "batch_heuristic_size_limit", None)
     if batch_size_limit is not None:
         selected_row = next((r for r in rows if r["qp"] == selected_qp), None)
         if selected_row is not None:
             est_size = int(selected_row.get("size_bytes", 0))
             if est_size > batch_size_limit:
-                raise BatchOutputLargerThanSourceError(
-                    f"estimated {est_size / 1e6:.1f} MB > source "
-                    f"{batch_size_limit / 1e6:.1f} MB at QP={selected_qp}"
+                fitting = next(
+                    (
+                        r for r in rows
+                        if int(r["qp"]) > selected_qp
+                        and int(r.get("size_bytes", 0)) > 0
+                        and int(r.get("size_bytes", 0)) <= batch_size_limit
+                    ),
+                    None,
                 )
+                if fitting is not None:
+                    fallback_qp = int(fitting["qp"])
+                    fallback_size = int(fitting.get("size_bytes", 0))
+                    print(
+                        f"  Selected QP={selected_qp} estimated {est_size/1e6:.1f} MB > "
+                        f"source {batch_size_limit/1e6:.1f} MB; "
+                        f"using QP={fallback_qp} (est. {fallback_size/1e6:.1f} MB) "
+                        f"from existing ladder — no tier drop needed."
+                    )
+                    selected_qp = fallback_qp
+                    selected_qps = [fallback_qp]
+                else:
+                    raise BatchOutputLargerThanSourceError(
+                        f"estimated {est_size / 1e6:.1f} MB > source "
+                        f"{batch_size_limit / 1e6:.1f} MB at QP={selected_qp}"
+                    )
 
     extra_paths: list[str] = []
     if args.expected_eval == "sample":
@@ -3058,15 +3139,27 @@ def _run_transcode_pipeline(
             final_full_ssim = rerun_ssim
 
         final_path: str = final_file
-        dest_name: str = os.path.basename(final_path)
-        dest: str = os.path.join(os.path.dirname(args.input), dest_name)
+        _out_dir = getattr(args, 'output_dir', None)
+        _batch_root = getattr(args, '_batch_input_dir', None)
+        dest: str = _resolve_output_dest(
+            encoded_path=final_path,
+            source_path=args.input,
+            output_dir=_out_dir,
+            no_suffix=getattr(args, 'no_suffix', False),
+            batch_input_dir=_batch_root,
+        )
 
         shutil.move(final_path, dest)
         print(f"Optimized file: {dest} (QP={final_qp})")
         logging.info("Optimized file: %s (QP=%s)", dest, final_qp)
         for extra_path in extra_final_files:
-            extra_name = os.path.basename(extra_path)
-            extra_dest = os.path.join(os.path.dirname(args.input), extra_name)
+            extra_dest = _resolve_output_dest(
+                encoded_path=extra_path,
+                source_path=args.input,
+                output_dir=_out_dir,
+                no_suffix=False,
+                batch_input_dir=_batch_root,
+            )
             shutil.move(extra_path, extra_dest)
             print(f"Additional output: {extra_dest}")
             logging.info("Additional output: %s", extra_dest)
@@ -3289,7 +3382,28 @@ def _print_batch_excluded_summary(
         )
 
 
+def _predict_output_path(args: argparse.Namespace) -> str | None:
+    """Compute the expected output path when --output-dir + --no-suffix are active, else None."""
+    if not (getattr(args, 'output_dir', None) and getattr(args, 'no_suffix', False)):
+        return None
+    src_ext = os.path.splitext(args.input)[1].lower()
+    enc_ext = src_ext if src_ext in {'.mp4', '.mkv'} else '.mkv'
+    dummy_name = os.path.splitext(os.path.basename(args.input))[0] + enc_ext
+    return _resolve_output_dest(
+        encoded_path=dummy_name,
+        source_path=args.input,
+        output_dir=args.output_dir,
+        no_suffix=True,
+        batch_input_dir=getattr(args, '_batch_input_dir', None),
+    )
+
+
 def _run_single_file_pipeline(args: argparse.Namespace) -> tuple[str, int]:
+    predicted = _predict_output_path(args)
+    if predicted and os.path.exists(predicted):
+        print(f"Skipping (output exists): {predicted}")
+        logging.info("Skipping (output exists): %s", predicted)
+        return predicted, -1
     args.skip_baseline_requested = bool(args.skip_baseline)
     (
         extra_vf,
@@ -3396,6 +3510,7 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         while True:
             rep_args = argparse.Namespace(**vars(args))
             rep_args.input = rep_path
+            rep_args._batch_input_dir = args.input
             rep_args.source_quality = current_tier
             if batch_baseline_file:
                 rep_args.batch_precomputed_baseline_file = batch_baseline_file
@@ -3414,6 +3529,41 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
 
             try:
                 cluster_dest, cluster_qp = _run_single_file_pipeline(rep_args)
+                # Verify actual output size — the pre-flight estimate may have passed
+                # or been skipped (user-specified tier), but the real encode can still
+                # be larger than the source.
+                if (
+                    args.batch_size_guard
+                    and cluster_qp is not None
+                    and cluster_qp >= 0  # not a skip sentinel
+                    and cluster_dest
+                    and os.path.exists(cluster_dest)
+                ):
+                    actual_size = os.path.getsize(cluster_dest)
+                    source_size = os.path.getsize(rep_path)
+                    if actual_size > source_size:
+                        next_tier = _next_lower_tier(current_tier)
+                        try:
+                            os.remove(cluster_dest)
+                        except OSError:
+                            pass
+                        cluster_dest = None
+                        cluster_qp = None
+                        if next_tier is not None:
+                            print(
+                                f"[Cluster {cluster['id']}] Actual output "
+                                f"({actual_size/1e6:.1f} MB) > source "
+                                f"({source_size/1e6:.1f} MB); "
+                                f"retrying at lower tier '{next_tier}'."
+                            )
+                            current_tier = next_tier
+                            continue
+                        print(
+                            f"[Cluster {cluster['id']}] WARNING: output "
+                            f"({actual_size/1e6:.1f} MB) > source "
+                            f"({source_size/1e6:.1f} MB) at lowest tier; skipping cluster."
+                        )
+                        break
             except BatchOutputLargerThanSourceError as exc:
                 next_tier = _next_lower_tier(current_tier)
                 # next_tier is always non-None here because we only set the size limit
@@ -3440,6 +3590,9 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         if cluster_dest is None or cluster_qp is None:
             continue
         processed += 1
+        if cluster_qp < 0:
+            print(f"[Cluster {cluster['id']}] Representative output already exists; skipping peers.")
+            continue
         print(f"[Cluster {cluster['id']}] Learned QP={cluster_qp}. Applying to peers.")
 
         for member in members:
@@ -3449,6 +3602,7 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
             print(f"[Cluster {cluster['id']}] Re-encoding with fixed QP={cluster_qp}: {member_path}")
             member_args = argparse.Namespace(**vars(args))
             member_args.input = member_path
+            member_args._batch_input_dir = args.input
             member_args.source_quality = None
             member_args.expected_qp_alias = None
             member_args.initial_qp = int(cluster_qp)
@@ -3456,7 +3610,26 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
             member_args.skip_baseline = True
             member_args.batch_force_fixed_qp_mode = True
             try:
-                _run_single_file_pipeline(member_args)
+                _member_dest, _member_qp = _run_single_file_pipeline(member_args)
+                if (
+                    args.batch_size_guard
+                    and _member_qp >= 0  # not a skip sentinel
+                    and _member_dest
+                    and os.path.exists(_member_dest)
+                ):
+                    actual_size = os.path.getsize(_member_dest)
+                    source_size = os.path.getsize(member_path)
+                    if actual_size > source_size:
+                        print(
+                            f"[Cluster {cluster['id']}] WARNING: member output "
+                            f"({actual_size/1e6:.1f} MB) > source "
+                            f"({source_size/1e6:.1f} MB); discarding: {member_path}"
+                        )
+                        try:
+                            os.remove(_member_dest)
+                        except OSError:
+                            pass
+                        continue
                 processed += 1
             except Exception as exc:
                 print(f"[Cluster {cluster['id']}] ERROR: file failed: {exc}")
@@ -3485,6 +3658,9 @@ def main():
         args.skip_baseline = False
     if args.source_quality and args.expected_qp_alias is not None:
         print("WARNING: both --source-quality and --expected-qp provided; using --source-quality.")
+
+    if args.no_suffix and not args.output_dir:
+        parser.error("--no-suffix requires --output-dir")
 
     if args.batch_auto:
         try:

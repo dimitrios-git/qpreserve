@@ -39,8 +39,10 @@ def measure_ssim_on_sample(
 
 
 def _sample_encoded_path(sample_file: str) -> str:
-    ext = os.path.splitext(sample_file)[1]
-    return sample_file.replace(ext, f'_enc{ext}')
+    # Always use .mkv so the container supports any codec (HEVC+AAC).
+    # Source containers like .mpg (MPEG-PS) reject AAC and cause ffmpeg to fail.
+    stem = os.path.splitext(sample_file)[0]
+    return stem + '_enc.mkv'
 
 
 def _encode_sample(
@@ -64,7 +66,7 @@ def _encode_sample(
     except Exception as e:
         logging.warning(
             "Sample encode failed for %s at QP=%d (%s); using SSIM=0.",
-            sample_file, qp, e
+            sample_file, qp, str(e)[:200],
         )
         return False
     return True

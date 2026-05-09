@@ -11,6 +11,7 @@ Coordinates:
 
 import argparse
 import dataclasses
+import json
 import sys
 import logging
 import os
@@ -75,7 +76,7 @@ _RESIZE_HEIGHT_BY_LABEL: Dict[str, int] = {
 }
 
 _VIDEO_EXTENSIONS = {
-    ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts",
+    ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".mpg", ".mpeg",
 }
 
 _QP_FOR_TIER: Dict[str, int] = {"ultra": 9, "high": 13, "medium": 21, "low": 25, "lower": 30}
@@ -2450,6 +2451,24 @@ def _print_batch_excluded_summary(
         )
 
 
+def _write_qp_sidecar(dest: str, qp: int) -> None:
+    try:
+        with open(dest + ".qpreserve.json", "w") as f:
+            json.dump({"qp": qp}, f)
+    except OSError:
+        pass
+
+
+def _read_qp_sidecar(dest: str) -> int | None:
+    try:
+        with open(dest + ".qpreserve.json") as f:
+            data = json.load(f)
+        val = data.get("qp")
+        return int(val) if val is not None else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 def _predict_output_path(config: EncodeConfig) -> str | None:
     """Compute the expected output path when --output-dir + --no-suffix are active, else None."""
     if not (config.output_dir and config.no_suffix):
@@ -2474,13 +2493,16 @@ def _run_single_file_pipeline(config: EncodeConfig) -> tuple[str, int]:
         return predicted, -1
     config.skip_baseline_requested = bool(config.skip_baseline)
     extra_vf, codec, audio_opts, raw_fr = _prepare_main_context(config)
-    return _run_transcode_pipeline(
+    dest, qp = _run_transcode_pipeline(
         config=config,
         extra_vf=extra_vf,
         codec=codec,
         audio_opts=audio_opts,
         raw_fr=raw_fr,
     )
+    if qp >= 0:
+        _write_qp_sidecar(dest, qp)
+    return dest, qp
 
 
 def _run_batch_auto(config: EncodeConfig) -> None:
@@ -2667,8 +2689,19 @@ def _run_batch_auto(config: EncodeConfig) -> None:
             continue
         processed += 1
         if cluster_qp < 0:
-            print(f"[Cluster {cluster['id']}] Representative output already exists; skipping peers.")
-            continue
+            recovered_qp = _read_qp_sidecar(cluster_dest) if cluster_dest else None
+            if recovered_qp is not None:
+                print(
+                    f"[Cluster {cluster['id']}] Representative output already exists "
+                    f"(QP={recovered_qp} from previous run). Applying to peers."
+                )
+                cluster_qp = recovered_qp
+            else:
+                print(
+                    f"[Cluster {cluster['id']}] Representative output already exists; "
+                    "no QP record found. Skipping peers."
+                )
+                continue
         print(f"[Cluster {cluster['id']}] Learned QP={cluster_qp}. Applying to peers.")
 
         for member in members:

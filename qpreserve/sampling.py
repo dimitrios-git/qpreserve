@@ -309,11 +309,10 @@ def extract_sample_segments(
 
     tmpdir = tempfile.mkdtemp(prefix="size_sample_", dir=tmp_root)
     segments: list[str] = []
-    ext = os.path.splitext(input_file)[1]
 
     try:
         for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
-            seg = os.path.join(tmpdir, f"seg_{idx}{ext}")
+            seg = os.path.join(tmpdir, f"seg_{idx}.mkv")
             try:
                 run_cmd([
                     'ffmpeg', '-y',

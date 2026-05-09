@@ -926,15 +926,22 @@ def _prepare_size_segments(
     config: EncodeConfig,
     scratch_root: str,
 ) -> tuple[list[str], str | None]:
-    # Sample from the original source file, not the baseline.
-    # The baseline can be an order of magnitude larger than the source (QP=6 HEVC
-    # for 1080p H.264 input often runs 8-10× the input size), so extracting
-    # segments from it wastes scratch space unnecessarily. SSIM is measured as
-    # "quality of segment encoded at QP X relative to the segment itself", so
-    # the reference only needs to be consistent — and the original source is the
-    # correct perceptual ground truth. Exception: when use_baseline_as_source is
-    # set, the baseline may have been tonemapped/scaled and must be the reference.
-    sample_source = baseline_file if config.use_baseline_as_source else config.input
+    # For H.264 sources, sample from the original to avoid extracting from the
+    # (often much larger) QP=6 HEVC baseline. Cross-codec SSIM between H.264
+    # and HEVC is reliable because both codecs share similar block-DCT artifact
+    # profiles; quality degrades monotonically with QP as expected.
+    #
+    # For legacy codecs (MPEG-1, MPEG-2, VC-1, etc.), cross-codec SSIM breaks
+    # down: heavy HEVC quantization produces blocking artifacts that SSIM scores
+    # as MORE similar to the already-blocky source, causing SSIM to increase
+    # with QP and the algorithm to select excessively high QP values. Use the
+    # baseline (intra-HEVC comparison) so SSIM degrades properly with QP.
+    #
+    # Exception: use_baseline_as_source forces baseline regardless of codec
+    # (e.g. HDR→SDR tonemapped or scaled sources).
+    src_codec = normalize_video_codec(probe_video_codec(config.input))
+    use_source = not config.use_baseline_as_source and src_codec == "h264"
+    sample_source = config.input if use_source else baseline_file
     segments, segments_tmpdir, _, _ = extract_sample_segments(
         sample_source,
         percent=config.sample_percent,

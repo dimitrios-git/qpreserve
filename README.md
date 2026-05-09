@@ -1,11 +1,11 @@
 # QPreserve
 
-A command-line tool to find the optimal H.264 or H.265/HEVC encoding quality for any video by targeting a user-specified SSIM threshold.  
-It samples your video (via scene changes, motion peaks, or uniform intervals), measures SSIM on those clips across a QP range, and does a binary search to identify the lowest QP that still meets your quality goal—then applies that to the full file.
+A command-line tool to find the optimal H.264 or H.265/HEVC encoding quality for any video using the expected-QP sample ladder.  
+It samples your video (via scene changes, motion peaks, or uniform intervals), measures SSIM across a QP ladder starting from an estimated source quality tier, and selects the best QP—then applies that to the full file.
 
 ## Key Features
 
-- **Automated SSIM-guided QP search** — Samples representative segments and runs a binary search over QP values to hit a target SSIM.
+- **Expected-QP sample ladder** — Samples representative segments across a QP range starting from a source quality tier, measures SSIM on each step, and selects the knee-point QP. Works uniformly for all source codecs (H.264, HEVC, VP9, AV1).
 - **Flexible sampling modes** — Choose between uniform intervals, FFprobe scene-change detection, or motion peaks for smarter clip selection.
 - **CUDA-accelerated H.264 / HEVC encoding** — Uses NVIDIA's NVENC for fast re-encoding.
 - **Audio passthrough or re-encode** — Automatically copies or converts audio streams to AAC at matching bitrates/channels.
@@ -131,18 +131,18 @@ When `--no-suffix` is active, restarting an interrupted run automatically skips 
 
 | Option | Default | Description |
 | ------ | ------- | ----------- |
-| `--ssim` | `0.986` | Target SSIM threshold (0–1, higher = better quality) |
-| `--codec` | `h264_nvenc` | Video codec (`h264_nvenc`, `hevc_nvenc`) |
-| `--min-qp` | `6` | Minimum QP during binary search |
-| `--max-qp` | `40` | Maximum QP during binary search |
-| `--sampling-mode` | `auto` | Clip selection strategy (`uniform`, `scene`, `motion`, `auto`) |
+| `--ssim` | `0.986` | Target SSIM floor for the quality ladder |
+| `--source-quality` | — | Starting QP tier for the expected-QP ladder (`ultra`, `high`, `medium`, `low`, `lower`, or a numeric QP). Prompted interactively if omitted; defaults to `medium` in non-interactive mode. |
+| `--video-codec` | `h265` | Target video codec (`h264`, `h265`/`hevc`) |
+| `--min-qp` | `6` | Minimum QP allowed during ladder search |
+| `--max-qp` | `40` | Maximum QP allowed during ladder search |
+| `--sampling-mode` | `motion` | Clip selection strategy (`uniform`, `scene`, `motion`) |
 | `--sample-percent` | `auto` | Percentage of video duration used for sampling |
 | `--sample-count` | `auto` | Number of sample clips to extract |
-| `--resize` | — | Resize to a standard label (`720p`, `1080p`, `4k`, …) |
+| `--resize-resolution` | — | Resize to a standard label (`720p`, `1080p`, `2160p`, …) |
 | `--target-fps` | — | Downsample to target framerate (`24`, `30`, `60`, `120`) |
 | `--add-stereo-downmix` | off | Add a stereo AAC downmix alongside each multichannel stream |
 | `--add-stereo-downmix-copy-video` | off | Copy video stream; process audio only |
-| `--no-full-ssim` | off | Skip full-file SSIM verification (faster, less precise) |
 | `--batch-auto` | off | Directory input: cluster and batch-encode |
 | `--batch-dry-run` | off | Print planned batch actions without encoding |
 | `--batch-size-guard` | off | Keep outputs within source size: scan existing ladder first, then drop tier; verify actual size after encode |
@@ -155,10 +155,11 @@ Run `qpreserve --help` for the complete option list.
 
 ## How It Works
 
-1. **Baseline encode** — Encodes the source at a low QP to establish a perceptual reference.
+1. **Baseline encode** — Encodes the source at a low QP to establish a perceptual reference. For H.265/HEVC sources, the baseline is skipped by default when no filters are applied.
 2. **Sampling** — Extracts short representative clips using the chosen sampling strategy.
-3. **QP binary search** — Measures SSIM on each sample at candidate QP values and converges on the highest QP that still meets the target.
-4. **Final encode** — Re-encodes the full file at the selected QP, then optionally verifies SSIM on the result.
+3. **Expected-QP ladder** — Measures per-sample SSIM at each QP step starting from the source quality tier, building a ladder of size-vs-quality trade-offs. All source codecs (H.264, HEVC, VP9, AV1) go through this same path.
+4. **QP selection** — The ladder knee-point is identified and the user selects from the suggested safe/balanced QPs (or a custom QP from the ladder). In non-interactive or batch mode, the safe QP is chosen automatically.
+5. **Final encode** — Re-encodes the full file at the selected QP.
 
 ## License
 

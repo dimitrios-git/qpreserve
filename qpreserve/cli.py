@@ -76,7 +76,7 @@ _RESIZE_HEIGHT_BY_LABEL: Dict[str, int] = {
 }
 
 _VIDEO_EXTENSIONS = {
-    ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".mpg", ".mpeg",
+    ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".mpg", ".mpeg", ".wmv", ".flv", ".vid",
 }
 
 _QP_FOR_TIER: Dict[str, int] = {"ultra": 9, "high": 13, "medium": 21, "low": 25, "lower": 30}
@@ -324,11 +324,9 @@ def _determine_baseline_file(
                 return input_path
             if src_codec == "h265":
                 print("Skipping baseline generation; source codec is h265/hevc.")
-                return input_path
-            print(
-                f"--skip-baseline ignored: source codec is '{src_codec}'. "
-                "Baseline generation is required for non-h265 sources."
-            )
+            else:
+                print(f"Skipping baseline generation for {src_codec} source.")
+            return input_path
 
     baseline_file = encode_baseline(
         input_path,
@@ -357,6 +355,18 @@ def _maybe_enable_default_skip_baseline(
     if src_codec == "h265":
         config.skip_baseline = True
         print("Skipping baseline generation by default for h265/hevc source.")
+        return
+    if src_codec == "h264":
+        hdr_info = detect_hdr(input_path)
+        stream_info = probe_video_stream_info(input_path)
+        sar = stream_info.get("sample_aspect_ratio", "") or ""
+        pix_fmt = stream_info.get("pix_fmt", "") or ""
+        is_sdr = not hdr_info.get("is_hdr", False)
+        is_yuv420p = pix_fmt.startswith("yuv420p")
+        is_square_sar = sar in ("", "0:1", "1:1")
+        if is_sdr and is_yuv420p and is_square_sar:
+            config.skip_baseline = True
+            print("Skipping baseline generation by default for h264 SDR yuv420p source.")
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

@@ -485,7 +485,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              'than the source, automatically retry with the next lower tier.'
     )
     parser.add_argument(
-        '--disable-clustering',
+        '--batch-no-clustering',
         action='store_true',
         help='Batch mode: skip clustering and run the full quality search independently '
              'on every file. Produces optimal per-file results at the cost of speed.'
@@ -2527,12 +2527,12 @@ def _run_batch_auto(config: EncodeConfig) -> None:
         print("Batch mode: forcing --auto-crop off to avoid interactive prompts.")
         config.auto_crop = "off"
     config.expected_choice = "safe"
-    if not config.disable_clustering:
+    if not config.batch_no_clustering:
         print(
             "NOTE: Batch mode applies the QP learned from one representative to all peers "
             "in each cluster. Files with inflated bitrates (re-uploads, screen recordings) "
             "may land in the same cluster and receive a suboptimal QP. "
-            "Use --disable-clustering for independent per-file quality search."
+            "Use --batch-no-clustering for independent per-file quality search."
         )
 
     all_files = _list_video_files(config.input)
@@ -2577,7 +2577,7 @@ def _run_batch_auto(config: EncodeConfig) -> None:
         print("No clusters produced from batch scan.")
         return
 
-    if config.disable_clustering:
+    if config.batch_no_clustering:
         clusters = [
             {
                 "id": i + 1,

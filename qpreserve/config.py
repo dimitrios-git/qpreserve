@@ -38,7 +38,7 @@ class EncodeConfig:
     batch_bppf_tolerance: float = 0.15
     batch_bitrate_tolerance: float = 0.20
     re_encode_same_codec_video: bool = False
-    disable_clustering: bool = False
+    batch_no_clustering: bool = False
 
     # --- Output ---
     output: str | None = None       # explicit output file (single-file) or directory (batch)
@@ -103,7 +103,7 @@ def config_from_args(args: argparse.Namespace) -> EncodeConfig:
         batch_bppf_tolerance=args.batch_bppf_tolerance,
         batch_bitrate_tolerance=args.batch_bitrate_tolerance,
         re_encode_same_codec_video=args.re_encode_same_codec_video,
-        disable_clustering=args.disable_clustering,
+        batch_no_clustering=args.batch_no_clustering,
         output=args.output,
         baseline_qp=args.baseline_qp,
         skip_baseline=args.skip_baseline,

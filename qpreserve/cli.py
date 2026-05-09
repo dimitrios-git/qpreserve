@@ -42,7 +42,7 @@ from .utils import (
     output_codec_tag,
 )
 from .sampling import extract_samples, extract_sample_segments
-from .ssim_search import find_best_qp, measure_ssim, measure_ssim_values
+from .ssim_search import find_best_qp, measure_ssim, measure_ssim_values, _sample_encoded_sizes
 from .encoder import encode_final, encode_baseline
 
 _RESIZE_WIDTH_BY_LABEL_WIDESCREEN: Dict[str, int] = {
@@ -95,6 +95,9 @@ class BatchOutputLargerThanSourceError(Exception):
         super().__init__(message)
         self.baseline_file: str | None = None
         self.baseline_tmp: str | None = None
+        self.segments: list[str] = []
+        self.segments_tmpdir: str | None = None
+        self.rows: list[dict] = []
 
 
 def _print_h264_problems(problems: list[str]) -> None:
@@ -392,7 +395,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="How many sample clips to extract. Use an integer or 'auto'."
     )
     parser.add_argument('--sample-qp', type=int, default=6,
-                        help='QP used to encode sample clips.')
+                        help=argparse.SUPPRESS)
     parser.add_argument(
         '--initial-qp',
         type=int,
@@ -407,28 +410,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              'Guide: ultra=near-lossless, high=clean, medium=compressed, low=heavily compressed, lower=very heavily compressed.'
     )
     parser.add_argument(
-        '--expected-qp',
-        type=int,
-        dest='expected_qp_alias',
-        help=argparse.SUPPRESS
-    )
-    parser.add_argument(
         '--expected-min-gain',
         type=float,
         default=1.0,
-        help='Expected-QP mode: minimum per-step size gain percent considered meaningful.'
+        help=argparse.SUPPRESS
     )
     parser.add_argument(
         '--expected-max-steps',
         type=int,
         default=8,
-        help='Expected-QP mode: maximum number of QP steps to explore upward.'
+        help=argparse.SUPPRESS
     )
     parser.add_argument(
         '--expected-knee-ratio',
         type=float,
         default=1.5,
-        help='Expected-QP mode: velocity jump ratio used to detect the knee point.'
+        help=argparse.SUPPRESS
     )
     parser.add_argument(
         '--expected-choice',
@@ -453,13 +450,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         '--batch-bppf-tolerance',
         type=float,
         default=0.15,
-        help='Batch mode: relative bppf tolerance used to split quality clusters.'
+        help=argparse.SUPPRESS
     )
     parser.add_argument(
         '--batch-bitrate-tolerance',
         type=float,
         default=0.20,
-        help='Batch mode: relative bitrate tolerance used to split quality clusters.'
+        help=argparse.SUPPRESS
     )
     parser.add_argument(
         '--batch-dry-run',
@@ -566,7 +563,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         '--baseline-qp',
         type=int,
         default=6,
-        help='QP used to generate the baseline file.'
+        help=argparse.SUPPRESS
     )
     parser.add_argument(
         '--resize-resolution',
@@ -1876,7 +1873,7 @@ def _maybe_print_expected_mode_advice(
 
 
 def _expected_mode_requested(args: argparse.Namespace) -> bool:
-    return bool(args.source_quality) or (args.expected_qp_alias is not None)
+    return bool(args.source_quality)
 
 
 def _default_choice_for_tier(tier: str) -> str:
@@ -1982,8 +1979,6 @@ def _quality_label_to_qp(label: str) -> int | None:
 
 def _resolve_expected_start_qp(args: argparse.Namespace) -> int:
     token = args.source_quality
-    if token is None and args.expected_qp_alias is not None:
-        token = str(args.expected_qp_alias)
     if token is None:
         raise ValueError("Expected mode requested without source quality or expected qp.")
 
@@ -2348,182 +2343,212 @@ def _run_expected_qp_mode(
     max_qp = min(args.max_qp, start_qp + max(0, args.expected_max_steps))
     max_qp_hard = min(args.max_qp, 40)
 
-    rows: List[Dict[str, Any]]
-    if args.expected_eval == "sample":
-        rows = _build_expected_rows_sample(
-            args=args,
-            baseline_file=baseline_file,
-            raw_fr=raw_fr,
-            gop=gop,
-            audio_opts=audio_opts,
-            video_codec=video_codec,
-            scratch_root=scratch_root,
-            start_qp=start_qp,
-            max_qp=max_qp,
-        )
+    # Rows and segments are preserved across tier retries via BatchOutputLargerThanSourceError.
+    precomputed_rows: list[dict] | None = getattr(args, 'batch_precomputed_rows', None)
+    precomputed_segs: list[str] | None = getattr(args, 'batch_precomputed_segments', None)
+    precomputed_segs_tmpdir: str | None = getattr(args, 'batch_precomputed_segments_tmpdir', None)
+    if precomputed_segs is not None:
+        segments: list[str] = precomputed_segs
+        segments_tmpdir: str | None = precomputed_segs_tmpdir
+        own_segments = False
     else:
-        rows = _build_expected_rows_full(
-            args=args,
+        segments, segments_tmpdir = _prepare_size_segments(
             baseline_file=baseline_file,
-            raw_fr=raw_fr,
-            gop=gop,
-            audio_opts=audio_opts,
-            video_codec=video_codec,
-            tmpdir=tmpdir,
-            source_base=source_base,
-            source_ext=source_ext,
-            start_qp=start_qp,
-            max_qp=max_qp,
+            args=args,
+            scratch_root=scratch_root,
         )
+        own_segments = True
 
-    if not rows:
-        raise RuntimeError("Expected-QP mode could not produce any full-file encodes.")
-
-    use_raw_metric = False
-    if _is_flat_effective_regime(rows):
-        use_raw_metric = True
-        print(
-            "Adaptive ladder enabled: effective SSIM is flat "
-            "(range<=0.0005, cumulative<=0.0008, median drop/100MB<=0.00008)."
-        )
-        current_max_qp = int(rows[-1]["qp"])
-        if current_max_qp >= max_qp_hard:
-            print(f"Adaptive ladder stop: reached hard QP cap ({max_qp_hard}).")
-        else:
-            if args.expected_eval == "sample":
-                adaptive_max_qp = max_qp_hard
-            else:
-                adaptive_max_qp = min(max_qp_hard, current_max_qp + 6)
-            print(f"Adaptive ladder extending: QP {current_max_qp + 1}..{adaptive_max_qp}")
-            if args.expected_eval == "sample":
-                rows = _extend_expected_rows_sample_raw(
-                    args=args,
-                    baseline_file=baseline_file,
-                    raw_fr=raw_fr,
-                    gop=gop,
-                    audio_opts=audio_opts,
-                    video_codec=video_codec,
-                    scratch_root=scratch_root,
-                    rows=rows,
-                    start_qp=current_max_qp + 1,
-                    max_qp=adaptive_max_qp,
-                )
-            else:
-                extra_rows = _build_expected_rows_full(
-                    args=args,
-                    baseline_file=baseline_file,
-                    raw_fr=raw_fr,
-                    gop=gop,
-                    audio_opts=audio_opts,
-                    video_codec=video_codec,
-                    tmpdir=tmpdir,
-                    source_base=source_base,
-                    source_ext=source_ext,
-                    start_qp=current_max_qp + 1,
-                    max_qp=adaptive_max_qp,
-                )
-                rows.extend(extra_rows)
-            cutoff_idx, stop_reason = _find_adaptive_cutoff(rows)
-            if cutoff_idx < (len(rows) - 1):
-                rows = rows[:cutoff_idx + 1]
-            if stop_reason:
-                print(f"Adaptive ladder stop: {stop_reason}.")
-            elif int(rows[-1]["qp"]) >= max_qp_hard:
-                print(f"Adaptive ladder stop: reached hard QP cap ({max_qp_hard}).")
-            else:
-                print(f"Adaptive ladder stop: reached extension limit at QP={rows[-1]['qp']}.")
-
-    _print_expected_qp_ladder(rows)
-    safe_qp, balanced_qp = _suggest_expected_qps(
-        rows=rows,
-        min_gain_pct=args.expected_min_gain,
-        knee_ratio=args.expected_knee_ratio,
-        use_raw_metric=use_raw_metric,
-    )
-    src_codec = probe_video_codec(args.input)
-    src_size = _safe_file_size(args.input) or 0
-    selected_qps = _choose_expected_qps(
-        args=args,
-        rows=rows,
-        safe_qp=safe_qp,
-        balanced_qp=balanced_qp,
-        source_codec=src_codec,
-        source_size_bytes=src_size,
-        size_is_estimate=(args.expected_eval == "sample"),
-    )
-    selected_qp = selected_qps[0]
-    print(
-        f"Expected-QP mode suggestions: safe={safe_qp}, balanced={balanced_qp}. "
-        f"Selected QP(s)={selected_qps}."
-    )
-
-    # In batch mode with a heuristic tier, check the ladder estimate before encoding.
-    # If the selected QP predicts an output larger than the source, first scan the
-    # already-measured rows for a higher QP that fits — avoiding a full tier-drop
-    # retry that would re-measure all the same QP levels from scratch.
-    # Only raise BatchOutputLargerThanSourceError (triggering a tier drop) when no
-    # row in the current ladder can produce an output small enough.
-    batch_size_limit: int | None = getattr(args, "batch_heuristic_size_limit", None)
-    if batch_size_limit is not None:
-        selected_row = next((r for r in rows if r["qp"] == selected_qp), None)
-        if selected_row is not None:
-            est_size = int(selected_row.get("size_bytes", 0))
-            if est_size > batch_size_limit:
-                fitting = next(
-                    (
-                        r for r in rows
-                        if int(r["qp"]) > selected_qp
-                        and int(r.get("size_bytes", 0)) > 0
-                        and int(r.get("size_bytes", 0)) <= batch_size_limit
-                    ),
-                    None,
-                )
-                if fitting is not None:
-                    fallback_qp = int(fitting["qp"])
-                    fallback_size = int(fitting.get("size_bytes", 0))
-                    print(
-                        f"  Selected QP={selected_qp} estimated {est_size/1e6:.1f} MB > "
-                        f"source {batch_size_limit/1e6:.1f} MB; "
-                        f"using QP={fallback_qp} (est. {fallback_size/1e6:.1f} MB) "
-                        f"from existing ladder — no tier drop needed."
-                    )
-                    selected_qp = fallback_qp
-                    selected_qps = [fallback_qp]
-                else:
-                    raise BatchOutputLargerThanSourceError(
-                        f"estimated {est_size / 1e6:.1f} MB > source "
-                        f"{batch_size_limit / 1e6:.1f} MB at QP={selected_qp}"
-                    )
-
-    extra_paths: list[str] = []
-    if args.expected_eval == "sample":
-        print("Expected-QP sample mode: skipping post-selection full-file SSIM measurement.")
-        output_path: str | None = None
-        for idx, qp in enumerate(selected_qps):
-            result = encode_final(
-                input_file=baseline_file,
-                qp=qp,
-                audio_opts=audio_opts,
+    try:
+        rows: List[Dict[str, Any]]
+        if args.expected_eval == "sample":
+            rows = _build_expected_rows_sample(
+                args=args,
+                baseline_file=baseline_file,
                 raw_fr=raw_fr,
                 gop=gop,
+                audio_opts=audio_opts,
                 video_codec=video_codec,
-                return_ssim=False,
-                ssim_chunk_seconds=args.full_ssim_chunk_seconds,
-                output_dir=tmpdir,
-                output_base=source_base,
-                output_ext=source_ext,
+                scratch_root=scratch_root,
+                start_qp=start_qp,
+                max_qp=max_qp,
+                segments=segments,
+                segments_tmpdir=segments_tmpdir,
+                precomputed_rows=precomputed_rows,
             )
-            if idx == 0:
-                output_path = cast(str, result)
-            else:
-                extra_paths.append(cast(str, result))
-        if output_path is None:
-            raise RuntimeError("Expected-QP mode failed to encode selected output(s).")
-        selected_row = next((row for row in rows if row["qp"] == selected_qp), rows[0])
-        resolved_ssim = selected_row["ssim"]
-        return output_path, selected_qp, resolved_ssim, extra_paths
+        else:
+            rows = _build_expected_rows_full(
+                args=args,
+                baseline_file=baseline_file,
+                raw_fr=raw_fr,
+                gop=gop,
+                audio_opts=audio_opts,
+                video_codec=video_codec,
+                tmpdir=tmpdir,
+                source_base=source_base,
+                source_ext=source_ext,
+                start_qp=start_qp,
+                max_qp=max_qp,
+            )
 
-    return _finalize_expected_full_selection(rows, selected_qps)
+        if not rows:
+            raise RuntimeError("Expected-QP mode could not produce any full-file encodes.")
+
+        use_raw_metric = False
+        if _is_flat_effective_regime(rows):
+            use_raw_metric = True
+            print(
+                "Adaptive ladder enabled: effective SSIM is flat "
+                "(range<=0.0005, cumulative<=0.0008, median drop/100MB<=0.00008)."
+            )
+            current_max_qp = int(rows[-1]["qp"])
+            if current_max_qp >= max_qp_hard:
+                print(f"Adaptive ladder stop: reached hard QP cap ({max_qp_hard}).")
+            else:
+                if args.expected_eval == "sample":
+                    adaptive_max_qp = max_qp_hard
+                else:
+                    adaptive_max_qp = min(max_qp_hard, current_max_qp + 6)
+                print(f"Adaptive ladder extending: QP {current_max_qp + 1}..{adaptive_max_qp}")
+                if args.expected_eval == "sample":
+                    rows = _extend_expected_rows_sample_raw(
+                        args=args,
+                        baseline_file=baseline_file,
+                        raw_fr=raw_fr,
+                        gop=gop,
+                        audio_opts=audio_opts,
+                        video_codec=video_codec,
+                        scratch_root=scratch_root,
+                        rows=rows,
+                        start_qp=current_max_qp + 1,
+                        max_qp=adaptive_max_qp,
+                        segments=segments,
+                        segments_tmpdir=segments_tmpdir,
+                    )
+                else:
+                    extra_rows = _build_expected_rows_full(
+                        args=args,
+                        baseline_file=baseline_file,
+                        raw_fr=raw_fr,
+                        gop=gop,
+                        audio_opts=audio_opts,
+                        video_codec=video_codec,
+                        tmpdir=tmpdir,
+                        source_base=source_base,
+                        source_ext=source_ext,
+                        start_qp=current_max_qp + 1,
+                        max_qp=adaptive_max_qp,
+                    )
+                    rows.extend(extra_rows)
+                cutoff_idx, stop_reason = _find_adaptive_cutoff(rows)
+                if cutoff_idx < (len(rows) - 1):
+                    rows = rows[:cutoff_idx + 1]
+                if stop_reason:
+                    print(f"Adaptive ladder stop: {stop_reason}.")
+                elif int(rows[-1]["qp"]) >= max_qp_hard:
+                    print(f"Adaptive ladder stop: reached hard QP cap ({max_qp_hard}).")
+                else:
+                    print(f"Adaptive ladder stop: reached extension limit at QP={rows[-1]['qp']}.")
+
+        _print_expected_qp_ladder(rows)
+        safe_qp, balanced_qp = _suggest_expected_qps(
+            rows=rows,
+            min_gain_pct=args.expected_min_gain,
+            knee_ratio=args.expected_knee_ratio,
+            use_raw_metric=use_raw_metric,
+        )
+        src_codec = probe_video_codec(args.input)
+        src_size = _safe_file_size(args.input) or 0
+        selected_qps = _choose_expected_qps(
+            args=args,
+            rows=rows,
+            safe_qp=safe_qp,
+            balanced_qp=balanced_qp,
+            source_codec=src_codec,
+            source_size_bytes=src_size,
+            size_is_estimate=(args.expected_eval == "sample"),
+        )
+        selected_qp = selected_qps[0]
+        print(
+            f"Expected-QP mode suggestions: safe={safe_qp}, balanced={balanced_qp}. "
+            f"Selected QP(s)={selected_qps}."
+        )
+
+        # In batch mode with a heuristic tier, check the ladder estimate before encoding.
+        # If the selected QP predicts an output larger than the source, first scan the
+        # already-measured rows for a higher QP that fits — avoiding a full tier-drop
+        # retry that would re-measure all the same QP levels from scratch.
+        # Only raise BatchOutputLargerThanSourceError (triggering a tier drop) when no
+        # row in the current ladder can produce an output small enough.
+        batch_size_limit: int | None = getattr(args, "batch_heuristic_size_limit", None)
+        if batch_size_limit is not None:
+            selected_row = next((r for r in rows if r["qp"] == selected_qp), None)
+            if selected_row is not None:
+                est_size = int(selected_row.get("size_bytes", 0))
+                if est_size > batch_size_limit:
+                    fitting = next(
+                        (
+                            r for r in rows
+                            if int(r["qp"]) > selected_qp
+                            and int(r.get("size_bytes", 0)) > 0
+                            and int(r.get("size_bytes", 0)) <= batch_size_limit
+                        ),
+                        None,
+                    )
+                    if fitting is not None:
+                        fallback_qp = int(fitting["qp"])
+                        fallback_size = int(fitting.get("size_bytes", 0))
+                        print(
+                            f"  Selected QP={selected_qp} estimated {est_size/1e6:.1f} MB > "
+                            f"source {batch_size_limit/1e6:.1f} MB; "
+                            f"using QP={fallback_qp} (est. {fallback_size/1e6:.1f} MB) "
+                            f"from existing ladder — no tier drop needed."
+                        )
+                        selected_qp = fallback_qp
+                        selected_qps = [fallback_qp]
+                    else:
+                        err = BatchOutputLargerThanSourceError(
+                            f"estimated {est_size / 1e6:.1f} MB > source "
+                            f"{batch_size_limit / 1e6:.1f} MB at QP={selected_qp}"
+                        )
+                        err.segments = segments
+                        err.segments_tmpdir = segments_tmpdir
+                        err.rows = rows
+                        own_segments = False  # exception takes ownership of cleanup
+                        raise err
+
+        extra_paths: list[str] = []
+        if args.expected_eval == "sample":
+            print("Expected-QP sample mode: skipping post-selection full-file SSIM measurement.")
+            output_path: str | None = None
+            for idx, qp in enumerate(selected_qps):
+                result = encode_final(
+                    input_file=baseline_file,
+                    qp=qp,
+                    audio_opts=audio_opts,
+                    raw_fr=raw_fr,
+                    gop=gop,
+                    video_codec=video_codec,
+                    return_ssim=False,
+                    ssim_chunk_seconds=args.full_ssim_chunk_seconds,
+                    output_dir=tmpdir,
+                    output_base=source_base,
+                    output_ext=source_ext,
+                )
+                if idx == 0:
+                    output_path = cast(str, result)
+                else:
+                    extra_paths.append(cast(str, result))
+            if output_path is None:
+                raise RuntimeError("Expected-QP mode failed to encode selected output(s).")
+            selected_row = next((row for row in rows if row["qp"] == selected_qp), rows[0])
+            resolved_ssim = selected_row["ssim"]
+            return output_path, selected_qp, resolved_ssim, extra_paths
+
+        return _finalize_expected_full_selection(rows, selected_qps)
+    finally:
+        if own_segments and segments_tmpdir:
+            shutil.rmtree(segments_tmpdir, ignore_errors=True)
 
 
 def _build_expected_rows_sample(
@@ -2536,20 +2561,51 @@ def _build_expected_rows_sample(
     scratch_root: str,
     start_qp: int,
     max_qp: int,
+    segments: list[str] | None = None,
+    segments_tmpdir: str | None = None,
+    precomputed_rows: list[dict] | None = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     baseline_vals: List[float] | None = None
     baseline_metric = 0.0
     prev_tail_drop = 0.0
-    segments, segments_tmpdir = _prepare_size_segments(
-        baseline_file=baseline_file,
-        args=args,
-        scratch_root=scratch_root,
-    )
+    effective_start = start_qp
+
+    # Reuse the row for start_qp from a previous tier run if available, so we skip
+    # re-measuring a QP that was already measured and use its per-sample SSIM values
+    # as the baseline for tail_drop continuity on subsequent QPs.
+    if precomputed_rows:
+        precomputed_by_qp = {int(r["qp"]): r for r in precomputed_rows}
+        if start_qp in precomputed_by_qp:
+            carried = precomputed_by_qp[start_qp]
+            prior_sample_vals: list[float] = carried.get("raw_sample_vals") or []
+            if prior_sample_vals:
+                baseline_vals = prior_sample_vals
+                baseline_metric = mean(baseline_vals)
+                rows.append({
+                    "qp": start_qp,
+                    "ssim": float(baseline_metric),
+                    "raw_ssim": float(baseline_metric),
+                    "size_bytes": int(carried.get("size_bytes", 0)),
+                    "raw_sample_vals": prior_sample_vals,
+                })
+                effective_start = start_qp + 1
+                print(
+                    f"  [Row reuse] QP={start_qp} carried from previous tier "
+                    f"(raw_avg={baseline_metric:.6f}); starting ladder at QP={effective_start}."
+                )
+
+    own_segments = segments is None
+    if own_segments:
+        segments, segments_tmpdir = _prepare_size_segments(
+            baseline_file=baseline_file,
+            args=args,
+            scratch_root=scratch_root,
+        )
     if not segments:
         raise RuntimeError("Expected-QP sample mode could not extract sample segments.")
     try:
-        for qp in range(start_qp, max_qp + 1):
+        for qp in range(effective_start, max_qp + 1):
             sample_vals = measure_ssim_values(
                 qp=qp,
                 samples=segments,
@@ -2573,21 +2629,14 @@ def _build_expected_rows_sample(
                 tail_drop = max(prev_tail_drop, tail_drop)
                 prev_tail_drop = tail_drop
                 effective_metric = max(0.0, baseline_metric - tail_drop)
-            sample_bytes = _encode_samples_for_qp(
-                segments=segments,
-                qp=qp,
-                audio_opts=audio_opts,
-                raw_fr=raw_fr,
-                gop=gop,
-                tmp_root=scratch_root,
-                video_codec=video_codec,
-            )
+            sample_bytes = _sample_encoded_sizes(segments)
             size_bytes = _estimate_full_size_from_samples(sample_bytes, args.sample_percent)
             rows.append({
                 "qp": qp,
                 "ssim": float(effective_metric),
                 "raw_ssim": float(sample_metric),
                 "size_bytes": int(size_bytes),
+                "raw_sample_vals": sample_vals,
             })
             tqdm_msg = (
                 f"Expected-QP sample metric at QP={qp}: "
@@ -2596,7 +2645,7 @@ def _build_expected_rows_sample(
             print(tqdm_msg)
             _print_expected_step_progress(rows, estimate=True)
     finally:
-        if segments_tmpdir:
+        if own_segments and segments_tmpdir:
             shutil.rmtree(segments_tmpdir, ignore_errors=True)
     return rows
 
@@ -2612,14 +2661,18 @@ def _extend_expected_rows_sample_raw(
     rows: List[Dict[str, Any]],
     start_qp: int,
     max_qp: int,
+    segments: list[str] | None = None,
+    segments_tmpdir: str | None = None,
 ) -> List[Dict[str, Any]]:
     if start_qp > max_qp:
         return rows
-    segments, segments_tmpdir = _prepare_size_segments(
-        baseline_file=baseline_file,
-        args=args,
-        scratch_root=scratch_root,
-    )
+    own_segments = segments is None
+    if own_segments:
+        segments, segments_tmpdir = _prepare_size_segments(
+            baseline_file=baseline_file,
+            args=args,
+            scratch_root=scratch_root,
+        )
     if not segments:
         raise RuntimeError("Adaptive expected-QP sample extension could not extract sample segments.")
     try:
@@ -2633,15 +2686,7 @@ def _extend_expected_rows_sample_raw(
                 video_codec=video_codec,
             )
             sample_metric = mean(sample_vals) if sample_vals else 0.0
-            sample_bytes = _encode_samples_for_qp(
-                segments=segments,
-                qp=qp,
-                audio_opts=audio_opts,
-                raw_fr=raw_fr,
-                gop=gop,
-                tmp_root=scratch_root,
-                video_codec=video_codec,
-            )
+            sample_bytes = _sample_encoded_sizes(segments)
             size_bytes = _estimate_full_size_from_samples(sample_bytes, args.sample_percent)
             rows.append({
                 "qp": qp,
@@ -2655,7 +2700,7 @@ def _extend_expected_rows_sample_raw(
             )
             _print_expected_step_progress(rows, estimate=True)
     finally:
-        if segments_tmpdir:
+        if own_segments and segments_tmpdir:
             shutil.rmtree(segments_tmpdir, ignore_errors=True)
     return rows
 
@@ -3503,9 +3548,12 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         cluster_dest: str | None = None
         cluster_qp: int | None = None
         current_tier = initial_tier
-        # Baseline preserved across tier retries so it is not recreated each time.
+        # Baseline, segments, and measured rows preserved across tier retries.
         batch_baseline_file: str | None = None
         batch_baseline_tmp: str | None = None
+        batch_segments: list[str] = []
+        batch_segments_tmpdir: str | None = None
+        batch_rows: list[dict] = []
 
         while True:
             rep_args = argparse.Namespace(**vars(args))
@@ -3514,6 +3562,11 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
             rep_args.source_quality = current_tier
             if batch_baseline_file:
                 rep_args.batch_precomputed_baseline_file = batch_baseline_file
+            if batch_segments:
+                rep_args.batch_precomputed_segments = batch_segments
+                rep_args.batch_precomputed_segments_tmpdir = batch_segments_tmpdir
+            if batch_rows:
+                rep_args.batch_precomputed_rows = batch_rows
             if heuristic_tier:
                 print(
                     f"[Cluster {cluster['id']}] No --source-quality provided; "
@@ -3575,6 +3628,11 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
                 if exc.baseline_file:
                     batch_baseline_file = exc.baseline_file
                     batch_baseline_tmp = exc.baseline_tmp
+                if exc.segments:
+                    batch_segments = exc.segments
+                    batch_segments_tmpdir = exc.segments_tmpdir
+                if exc.rows:
+                    batch_rows = exc.rows
                 current_tier = next_tier  # type: ignore[assignment]
                 continue
             except Exception as exc:
@@ -3586,6 +3644,8 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
 
         if batch_baseline_tmp:
             shutil.rmtree(batch_baseline_tmp, ignore_errors=True)
+        if batch_segments_tmpdir:
+            shutil.rmtree(batch_segments_tmpdir, ignore_errors=True)
 
         if cluster_dest is None or cluster_qp is None:
             continue
@@ -3604,7 +3664,6 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
             member_args.input = member_path
             member_args._batch_input_dir = args.input
             member_args.source_quality = None
-            member_args.expected_qp_alias = None
             member_args.initial_qp = int(cluster_qp)
             member_args.skip_full_ssim = True
             member_args.skip_baseline = True
@@ -3656,9 +3715,6 @@ def main():
     if args.use_baseline_as_source and args.skip_baseline:
         print("WARNING: --use-baseline-as-source requires a baseline; ignoring --skip-baseline.")
         args.skip_baseline = False
-    if args.source_quality and args.expected_qp_alias is not None:
-        print("WARNING: both --source-quality and --expected-qp provided; using --source-quality.")
-
     if args.no_suffix and not args.output_dir:
         parser.error("--no-suffix requires --output-dir")
 

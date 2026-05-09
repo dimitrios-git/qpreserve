@@ -207,6 +207,17 @@ def measure_ssim(
     return results[metric]
 
 
+def _sample_encoded_sizes(segments: List[str]) -> int:
+    """Sum the sizes of the _enc files left on disk by measure_ssim_values()."""
+    total = 0
+    for seg in segments:
+        try:
+            total += os.path.getsize(_sample_encoded_path(seg))
+        except OSError:
+            pass
+    return total
+
+
 def measure_ssim_values(
     qp: int,
     samples: List[str],

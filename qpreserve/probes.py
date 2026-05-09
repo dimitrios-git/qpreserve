@@ -3,17 +3,25 @@ import json
 from typing import Any, Dict, List
 from .utils import run_cmd
 
+_cache: Dict[tuple, Any] = {}
+
+
+def _probe(key: tuple, cmd: list) -> Any:
+    if key not in _cache:
+        res = run_cmd(cmd, capture_output=True)
+        _cache[key] = json.loads(res.stdout)
+    return _cache[key]
+
 
 def probe_video_framerate(input_file: str) -> float:
-    res = run_cmd([
-        'ffprobe', '-v', 'quiet',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=r_frame_rate',
-        '-of', 'json',
-        input_file
-    ], capture_output=True)
-
-    data = json.loads(res.stdout)
+    data = _probe(
+        ('framerate', input_file),
+        ['ffprobe', '-v', 'quiet',
+         '-select_streams', 'v:0',
+         '-show_entries', 'stream=r_frame_rate',
+         '-of', 'json',
+         input_file]
+    )
     streams = data.get('streams') or []
     if not streams:
         raise ValueError(f"No video stream found in: {input_file}")
@@ -23,14 +31,13 @@ def probe_video_framerate(input_file: str) -> float:
 
 
 def probe_video_duration(input_file: str) -> float:
-    res = run_cmd([
-        'ffprobe', '-v', 'quiet',
-        '-show_entries', 'format=duration',
-        '-of', 'json',
-        input_file
-    ], capture_output=True)
-
-    data = json.loads(res.stdout)
+    data = _probe(
+        ('duration', input_file),
+        ['ffprobe', '-v', 'quiet',
+         '-show_entries', 'format=duration',
+         '-of', 'json',
+         input_file]
+    )
     fmt = data.get('format') or {}
     duration = fmt.get('duration')
     if duration is None:
@@ -39,14 +46,14 @@ def probe_video_duration(input_file: str) -> float:
 
 
 def probe_audio_streams(input_file: str) -> List[Dict[str, Any]]:
-    res = run_cmd([
-        'ffprobe', '-v', 'quiet',
-        '-show_entries', 'stream=index,codec_type,codec_name,channels,channel_layout:stream_tags=language',
-        '-select_streams', 'a',
-        '-of', 'json',
-        input_file
-    ], capture_output=True)
-    data = json.loads(res.stdout)
+    data = _probe(
+        ('audio_streams', input_file),
+        ['ffprobe', '-v', 'quiet',
+         '-show_entries', 'stream=index,codec_type,codec_name,channels,channel_layout:stream_tags=language',
+         '-select_streams', 'a',
+         '-of', 'json',
+         input_file]
+    )
     return data.get('streams', [])
 
 
@@ -60,17 +67,15 @@ def detect_hdr(input_file: str) -> Dict[str, Any]:
             "matrix": "..."
         }
     """
-
-    res = run_cmd([
-        'ffprobe', '-v', 'quiet',
-        '-select_streams', 'v:0',
-        '-show_entries',
-        'stream=color_primaries,color_transfer,color_space',
-        '-of', 'json',
-        input_file
-    ], capture_output=True)
-
-    data = json.loads(res.stdout)
+    data = _probe(
+        ('hdr', input_file),
+        ['ffprobe', '-v', 'quiet',
+         '-select_streams', 'v:0',
+         '-show_entries',
+         'stream=color_primaries,color_transfer,color_space',
+         '-of', 'json',
+         input_file]
+    )
     streams = data.get('streams') or []
     if not streams:
         raise ValueError(f"No video stream found in: {input_file}")
@@ -98,15 +103,14 @@ def probe_video_stream_info(input_file: str) -> Dict[str, Any]:
     """
     Return basic geometry info of the first video stream.
     """
-    res = run_cmd([
-        'ffprobe', '-v', 'quiet',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio',
-        '-of', 'json',
-        input_file
-    ], capture_output=True)
-
-    data = json.loads(res.stdout)
+    data = _probe(
+        ('stream_info', input_file),
+        ['ffprobe', '-v', 'quiet',
+         '-select_streams', 'v:0',
+         '-show_entries', 'stream=width,height,pix_fmt,sample_aspect_ratio,display_aspect_ratio',
+         '-of', 'json',
+         input_file]
+    )
     streams = data.get('streams') or []
     if not streams:
         raise ValueError(f"No video stream found in: {input_file}")
@@ -125,15 +129,14 @@ def probe_video_codec(input_file: str) -> str:
     """
     Return codec_name of the first video stream (lowercased).
     """
-    res = run_cmd([
-        'ffprobe', '-v', 'quiet',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=codec_name',
-        '-of', 'json',
-        input_file
-    ], capture_output=True)
-
-    data = json.loads(res.stdout)
+    data = _probe(
+        ('codec', input_file),
+        ['ffprobe', '-v', 'quiet',
+         '-select_streams', 'v:0',
+         '-show_entries', 'stream=codec_name',
+         '-of', 'json',
+         input_file]
+    )
     streams = data.get('streams') or []
     if not streams:
         raise ValueError(f"No video stream found in: {input_file}")
@@ -144,15 +147,14 @@ def probe_video_bitrate(input_file: str) -> int | None:
     """
     Return bit_rate (bps) of the first video stream if available.
     """
-    res = run_cmd([
-        'ffprobe', '-v', 'quiet',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=bit_rate',
-        '-of', 'json',
-        input_file
-    ], capture_output=True)
-
-    data = json.loads(res.stdout)
+    data = _probe(
+        ('bitrate', input_file),
+        ['ffprobe', '-v', 'quiet',
+         '-select_streams', 'v:0',
+         '-show_entries', 'stream=bit_rate',
+         '-of', 'json',
+         input_file]
+    )
     streams = data.get('streams') or []
     if not streams:
         return None

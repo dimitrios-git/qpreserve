@@ -115,6 +115,18 @@ The guard operates in two layers:
 
 Note: this guard is intentionally off by default. Transcoding across codecs (e.g. HEVC → H.264) commonly produces a larger output and that is expected behaviour.
 
+### Batch mode limitations
+
+Clusters are formed by codec, resolution, framerate, and bits-per-pixel-per-frame (bppf). Files in the same cluster share a single QP derived from their representative. This works well when the cluster is homogeneous, but **inflated bitrates are a blind spot**: a re-upload or padded file may have a similar bppf to a genuinely high-quality source yet contain far less real detail, causing peers to receive a suboptimal QP.
+
+Use `--disable-clustering` to run the full quality search independently on every file:
+
+```bash
+qpreserve /path/to/videos/ /path/to/output/ --disable-clustering
+```
+
+This is slower (every file runs its own SSIM ladder) but produces optimal per-file results regardless of bitrate inflation. Use `--batch-dry-run` without `--disable-clustering` first to review the cluster groupings before committing to a full run.
+
 ### Resume interrupted batch runs
 
 Re-running the same batch command automatically skips files whose output already exists in the output directory.
@@ -137,6 +149,7 @@ Re-running the same batch command automatically skips files whose output already
 | `--add-stereo-downmix-copy-video` | off | Copy video stream; process audio only |
 | `--batch-dry-run` | off | Print planned batch actions without encoding |
 | `--batch-size-guard` | off | Keep outputs within source size: scan existing ladder first, then drop tier; verify actual size after encode |
+| `--disable-clustering` | off | Skip clustering; run the full quality search independently on every file |
 | `--log-file` | — | Write log output to a file |
 | `-v` / `--verbose` | off | Enable verbose logging |
 

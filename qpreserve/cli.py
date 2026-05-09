@@ -484,6 +484,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help='Batch mode: if the estimated output at the selected quality tier is larger '
              'than the source, automatically retry with the next lower tier.'
     )
+    parser.add_argument(
+        '--disable-clustering',
+        action='store_true',
+        help='Batch mode: skip clustering and run the full quality search independently '
+             'on every file. Produces optimal per-file results at the cost of speed.'
+    )
 
     parser.add_argument(
         '--sampling-mode',
@@ -2521,6 +2527,13 @@ def _run_batch_auto(config: EncodeConfig) -> None:
         print("Batch mode: forcing --auto-crop off to avoid interactive prompts.")
         config.auto_crop = "off"
     config.expected_choice = "safe"
+    if not config.disable_clustering:
+        print(
+            "NOTE: Batch mode applies the QP learned from one representative to all peers "
+            "in each cluster. Files with inflated bitrates (re-uploads, screen recordings) "
+            "may land in the same cluster and receive a suboptimal QP. "
+            "Use --disable-clustering for independent per-file quality search."
+        )
 
     all_files = _list_video_files(config.input)
     if not all_files:
@@ -2563,6 +2576,18 @@ def _run_batch_auto(config: EncodeConfig) -> None:
     if not clusters:
         print("No clusters produced from batch scan.")
         return
+
+    if config.disable_clustering:
+        clusters = [
+            {
+                "id": i + 1,
+                "key": (p["codec"], int(p["width"]), int(p["height"]),
+                        float(p["fps_bucket"]), str(p["pix_fmt"]), bool(p["is_hdr"])),
+                "representative": p,
+                "members": [p],
+            }
+            for i, p in enumerate(included)
+        ]
 
     _print_batch_cluster_summary(clusters, config.input)
     if config.batch_dry_run:

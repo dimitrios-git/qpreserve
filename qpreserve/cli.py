@@ -375,12 +375,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument('input', help='Source video file (or directory when --batch-auto is used).')
+    parser.add_argument('input', help='Source video file or directory.')
     parser.add_argument(
-        '--batch-auto',
-        action='store_true',
-        help='Treat input as a directory. Cluster similar videos, sample one representative '
-             'per cluster, then reuse the discovered QP for the rest of the cluster.'
+        'output',
+        nargs='?',
+        default=None,
+        help='Output file (single-file mode) or output directory (batch mode). '
+             'If omitted in single-file mode, the output is placed alongside the source '
+             'with an auto-generated quality suffix. '
+             'Batch mode (directory input) requires this argument.'
     )
     parser.add_argument(
         '--video-codec',
@@ -586,22 +589,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              '"prompt" asks when a TTY is available; "force" applies automatically.'
     )
 
-    # Output placement
-    parser.add_argument(
-        '--output-dir',
-        metavar='DIR',
-        default=None,
-        help='Root directory for output files. When used with --batch-auto, the relative path '
-             'of each source file within the input directory is recreated under this directory.'
-    )
-    parser.add_argument(
-        '--no-suffix',
-        action='store_true',
-        default=False,
-        help='Omit the quality/codec suffix from output filenames. '
-             'Only valid when --output-dir is set.'
-    )
-
     return parser
 
 
@@ -717,24 +704,31 @@ def _resolve_target_framerate(source_fr: float, target_fps: float | None) -> flo
 def _resolve_output_dest(
     encoded_path: str,
     source_path: str,
-    output_dir: str | None,
-    no_suffix: bool,
+    explicit_output: str | None,
     batch_input_dir: str | None = None,
 ) -> str:
-    dest_name = os.path.basename(encoded_path)
-    if output_dir:
+    if explicit_output is None:
+        # Auto-name alongside source; encoded_path already carries the quality suffix.
+        return os.path.join(os.path.dirname(source_path), os.path.basename(encoded_path))
+
+    if os.path.isdir(explicit_output):
+        # Directory destination (batch mode or user passed an existing dir).
+        # Reconstruct relative subdirectory structure when inside a batch run.
         if batch_input_dir:
             rel_dir = os.path.relpath(os.path.dirname(source_path), batch_input_dir)
-            out_subdir = os.path.normpath(os.path.join(output_dir, rel_dir))
+            out_subdir = os.path.normpath(os.path.join(explicit_output, rel_dir))
         else:
-            out_subdir = output_dir
+            out_subdir = explicit_output
         os.makedirs(out_subdir, exist_ok=True)
-        if no_suffix:
-            _, enc_ext = os.path.splitext(dest_name)
-            src_base = os.path.splitext(os.path.basename(source_path))[0]
-            dest_name = f"{src_base}{enc_ext}"
-        return os.path.join(out_subdir, dest_name)
-    return os.path.join(os.path.dirname(source_path), dest_name)
+        _, enc_ext = os.path.splitext(encoded_path)
+        src_base = os.path.splitext(os.path.basename(source_path))[0]
+        return os.path.join(out_subdir, f"{src_base}{enc_ext}")
+
+    # Explicit file path: use exactly as given.
+    parent = os.path.dirname(explicit_output)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return explicit_output
 
 
 def _run_audio_only_copy_video(
@@ -799,8 +793,7 @@ def _maybe_run_audio_only_path(config: EncodeConfig) -> bool:
         dest = _resolve_output_dest(
             encoded_path=output_path,
             source_path=config.input,
-            output_dir=config.output_dir,
-            no_suffix=config.no_suffix,
+            explicit_output=config.output,
             batch_input_dir=config.batch_input_dir,
         )
         shutil.move(output_path, dest)
@@ -902,7 +895,7 @@ def _resolve_source_ref_path(
 ) -> str:
     skip_baseline_forced_off = config.skip_baseline and not _same_file(baseline_file, config.input)
     if skip_baseline_forced_off and not config.use_baseline_as_source:
-        if config.batch_auto:
+        if config.batch_mode:
             print("Tip: use --use-baseline-as-source to treat the baseline as the source.")
         elif _prompt_use_baseline_as_source():
             config.use_baseline_as_source = True
@@ -1361,7 +1354,7 @@ def _resolve_source_quality_choice(default_choice: str) -> str | None:
 def _ensure_source_quality_for_default_pipeline(config: EncodeConfig) -> bool:
     if _expected_mode_requested(config):
         return True
-    if config.batch_auto:
+    if config.batch_mode:
         return True
     if not sys.stdin.isatty():
         config.source_quality = "medium"
@@ -2232,22 +2225,16 @@ def _run_transcode_pipeline(
         dest: str = _resolve_output_dest(
             encoded_path=final_path,
             source_path=config.input,
-            output_dir=config.output_dir,
-            no_suffix=config.no_suffix,
+            explicit_output=config.output,
             batch_input_dir=config.batch_input_dir,
         )
 
         shutil.move(final_path, dest)
         print(f"Optimized file: {dest} (QP={final_qp})")
         logging.info("Optimized file: %s (QP=%s)", dest, final_qp)
+        dest_dir = os.path.dirname(dest) or "."
         for extra_path in extra_final_files:
-            extra_dest = _resolve_output_dest(
-                encoded_path=extra_path,
-                source_path=config.input,
-                output_dir=config.output_dir,
-                no_suffix=False,
-                batch_input_dir=config.batch_input_dir,
-            )
+            extra_dest = os.path.join(dest_dir, os.path.basename(extra_path))
             shutil.move(extra_path, extra_dest)
             print(f"Additional output: {extra_dest}")
             logging.info("Additional output: %s", extra_dest)
@@ -2487,19 +2474,26 @@ def _read_qp_sidecar(dest: str) -> int | None:
 
 
 def _predict_output_path(config: EncodeConfig) -> str | None:
-    """Compute the expected output path when --output-dir + --no-suffix are active, else None."""
-    if not (config.output_dir and config.no_suffix):
+    """Return the expected output path when it can be determined before encoding, else None.
+
+    When config.output is None (auto-naming), the path cannot be predicted because
+    it includes the QP discovered during encoding.
+    """
+    if config.output is None:
         return None
-    src_ext = os.path.splitext(config.input)[1].lower()
-    enc_ext = src_ext if src_ext in {'.mp4', '.mkv'} else '.mkv'
-    dummy_name = os.path.splitext(os.path.basename(config.input))[0] + enc_ext
-    return _resolve_output_dest(
-        encoded_path=dummy_name,
-        source_path=config.input,
-        output_dir=config.output_dir,
-        no_suffix=True,
-        batch_input_dir=config.batch_input_dir,
-    )
+    if os.path.isdir(config.output):
+        # Directory destination: construct the path from source basename + extension.
+        src_ext = os.path.splitext(config.input)[1].lower()
+        enc_ext = src_ext if src_ext in {'.mp4', '.mkv'} else '.mkv'
+        dummy_encoded = os.path.splitext(os.path.basename(config.input))[0] + enc_ext
+        return _resolve_output_dest(
+            encoded_path=dummy_encoded,
+            source_path=config.input,
+            explicit_output=config.output,
+            batch_input_dir=config.batch_input_dir,
+        )
+    # Explicit file path.
+    return config.output
 
 
 def _run_single_file_pipeline(config: EncodeConfig) -> tuple[str, int]:
@@ -2523,9 +2517,6 @@ def _run_single_file_pipeline(config: EncodeConfig) -> tuple[str, int]:
 
 
 def _run_batch_auto(config: EncodeConfig) -> None:
-    if not os.path.isdir(config.input):
-        raise ValueError("--batch-auto requires the input path to be a directory.")
-
     if config.auto_crop == "prompt":
         print("Batch mode: forcing --auto-crop off to avoid interactive prompts.")
         config.auto_crop = "off"
@@ -2783,15 +2774,30 @@ def main():
     if config.use_baseline_as_source and config.skip_baseline:
         print("WARNING: --use-baseline-as-source requires a baseline; ignoring --skip-baseline.")
         config.skip_baseline = False
-    if config.no_suffix and not config.output_dir:
-        parser.error("--no-suffix requires --output-dir")
 
-    if config.batch_auto:
+    def _is_same_or_subpath(child: str, parent: str) -> bool:
+        child_r = os.path.realpath(child)
+        parent_r = os.path.realpath(parent)
+        return child_r == parent_r or child_r.startswith(parent_r + os.sep)
+
+    if os.path.isdir(config.input):
+        config.batch_mode = True
+        if config.output is None:
+            parser.error("batch mode requires an explicit output directory")
+        if _is_same_or_subpath(config.output, config.input):
+            parser.error("output directory must not be the same as or inside the input directory")
+        if _is_same_or_subpath(config.input, config.output):
+            parser.error("input directory must not be inside the output directory")
+        os.makedirs(config.output, exist_ok=True)
         try:
             _run_batch_auto(config)
         except ValueError as exc:
             print(f"ERROR: {exc}")
         return
+
+    if config.output is not None:
+        if os.path.realpath(config.output) == os.path.realpath(config.input):
+            parser.error("output path must differ from input path")
 
     if not os.path.isfile(config.input):
         logging.error("Input file not found: %s", config.input)

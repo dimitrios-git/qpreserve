@@ -32,7 +32,7 @@ class EncodeConfig:
     expected_knee_ratio: float = 1.5
 
     # --- Batch mode ---
-    batch_auto: bool = False
+    batch_mode: bool = False        # derived in main() from input being a directory
     batch_dry_run: bool = False
     batch_size_guard: bool = False
     batch_bppf_tolerance: float = 0.15
@@ -40,8 +40,7 @@ class EncodeConfig:
     re_encode_same_codec_video: bool = False
 
     # --- Output ---
-    output_dir: str | None = None
-    no_suffix: bool = False
+    output: str | None = None       # explicit output file (single-file) or directory (batch)
 
     # --- Baseline ---
     baseline_qp: int = 6
@@ -98,14 +97,12 @@ def config_from_args(args: argparse.Namespace) -> EncodeConfig:
         expected_min_gain=args.expected_min_gain,
         expected_max_steps=args.expected_max_steps,
         expected_knee_ratio=args.expected_knee_ratio,
-        batch_auto=args.batch_auto,
         batch_dry_run=args.batch_dry_run,
         batch_size_guard=args.batch_size_guard,
         batch_bppf_tolerance=args.batch_bppf_tolerance,
         batch_bitrate_tolerance=args.batch_bitrate_tolerance,
         re_encode_same_codec_video=args.re_encode_same_codec_video,
-        output_dir=args.output_dir,
-        no_suffix=args.no_suffix,
+        output=args.output,
         baseline_qp=args.baseline_qp,
         skip_baseline=args.skip_baseline,
         use_baseline_as_source=args.use_baseline_as_source,

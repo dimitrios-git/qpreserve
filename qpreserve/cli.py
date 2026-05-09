@@ -269,18 +269,23 @@ def _resolve_scratch_root(scratch_dir: str | None) -> str:
 def _warn_if_scratch_space_low(
     scratch_root: str, input_path: str, skip_baseline: bool
 ) -> None:
-    # Warn if scratch space looks too small.
-    # Baseline+final+samples ~2.5x input; skip-baseline reduces temp usage.
     try:
         input_size = os.path.getsize(input_path)
-        multiplier = 1.5 if skip_baseline else 2.5
-        needed = int(input_size * multiplier)
+        if skip_baseline:
+            # No baseline: only sample _enc files + final encode ≈ 1.5× input.
+            needed = int(input_size * 1.5)
+        else:
+            # Baseline at QP=6 is typically 5–10× larger than the source
+            # (e.g. a 1 GB H.264 source produces a ~10 GB HEVC baseline).
+            # Use 10× as a conservative upper bound so the warning fires early.
+            needed = int(input_size * 10)
         free = shutil.disk_usage(scratch_root).free
         if free < needed:
             print(
                 f"WARNING: scratch dir '{scratch_root}' has {free/1e9:.1f} GB free; "
                 f"estimated need ~{needed/1e9:.1f} GB. "
-                "Use --scratch-dir to point to a disk-backed location."
+                "Use --scratch-dir (or SSIM_SCRATCH_DIR env var) to point to a "
+                "disk-backed location with sufficient space."
             )
     except OSError:
         pass
@@ -920,8 +925,17 @@ def _prepare_size_segments(
     config: EncodeConfig,
     scratch_root: str,
 ) -> tuple[list[str], str | None]:
+    # Sample from the original source file, not the baseline.
+    # The baseline can be an order of magnitude larger than the source (QP=6 HEVC
+    # for 1080p H.264 input often runs 8-10× the input size), so extracting
+    # segments from it wastes scratch space unnecessarily. SSIM is measured as
+    # "quality of segment encoded at QP X relative to the segment itself", so
+    # the reference only needs to be consistent — and the original source is the
+    # correct perceptual ground truth. Exception: when use_baseline_as_source is
+    # set, the baseline may have been tonemapped/scaled and must be the reference.
+    sample_source = baseline_file if config.use_baseline_as_source else config.input
     segments, segments_tmpdir, _, _ = extract_sample_segments(
-        baseline_file,
+        sample_source,
         percent=config.sample_percent,
         count=config.sample_count,
         sampling_mode=config.sampling_mode,

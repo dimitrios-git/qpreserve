@@ -20,14 +20,19 @@ def run_cmd(cmd: Sequence[Any], capture_output: bool = False, timeout: Optional[
     sample encoding, etc., where progress is NOT needed.
     """
     logging.debug("Running command: %s", " ".join(str(c) for c in cmd))
-    return subprocess.run(
-        cmd,
-        check=True,
-        stdout=(subprocess.PIPE if capture_output else subprocess.DEVNULL),
-        stderr=(subprocess.PIPE if capture_output else subprocess.DEVNULL),
-        text=True,
-        timeout=timeout
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            check=True,
+            stdout=(subprocess.PIPE if capture_output else subprocess.DEVNULL),
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout
+        )
+    except subprocess.CalledProcessError as e:
+        if e.stderr:
+            logging.error("Command failed (exit %d):\n%s", e.returncode, e.stderr[-4000:])
+        raise
 
 
 # ────────────────────────────────────────────────

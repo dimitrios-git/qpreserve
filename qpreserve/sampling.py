@@ -1,4 +1,5 @@
 # sampling.py
+import logging
 import os
 import shutil
 import tempfile
@@ -313,18 +314,25 @@ def extract_sample_segments(
     try:
         for idx, t in enumerate(tqdm(times, desc="Extracting samples")):
             seg = os.path.join(tmpdir, f"seg_{idx}{ext}")
-            run_cmd([
-                'ffmpeg', '-y',
-                '-fflags', '+discardcorrupt',
-                '-ss', str(t),
-                '-i', input_file,
-                '-t', str(clip_len),
-                '-c', 'copy',
-                seg
-            ])
-            segments.append(seg)
+            try:
+                run_cmd([
+                    'ffmpeg', '-y',
+                    '-fflags', '+discardcorrupt',
+                    '-ss', str(t),
+                    '-i', input_file,
+                    '-t', str(clip_len),
+                    '-c', 'copy',
+                    seg
+                ])
+                segments.append(seg)
+            except Exception as e:
+                logging.warning("Skipping sample segment at t=%.2fs: %s", t, e)
     except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
+
+    if not segments:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return [], "", clip_len, duration
 
     return segments, tmpdir, clip_len, duration

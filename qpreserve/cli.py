@@ -10,6 +10,7 @@ Coordinates:
 """
 
 import argparse
+import dataclasses
 import sys
 import logging
 import os
@@ -44,6 +45,7 @@ from .utils import (
 from .sampling import extract_sample_segments
 from .ssim_search import measure_ssim_values, _sample_encoded_sizes
 from .encoder import encode_final, encode_baseline
+from .config import EncodeConfig, config_from_args
 
 _RESIZE_WIDTH_BY_LABEL_WIDESCREEN: Dict[str, int] = {
     "2160p": 3840,
@@ -335,19 +337,19 @@ def _determine_baseline_file(
 
 
 def _maybe_enable_default_skip_baseline(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     input_path: str,
     extra_vf: str | None,
 ) -> None:
-    if args.skip_baseline:
+    if config.skip_baseline:
         return
     if extra_vf is not None:
         return
-    if args.use_baseline_as_source:
+    if config.use_baseline_as_source:
         return
     src_codec = normalize_video_codec(probe_video_codec(input_path))
     if src_codec == "h265":
-        args.skip_baseline = True
+        config.skip_baseline = True
         print("Skipping baseline generation by default for h265/hevc source.")
 
 
@@ -746,44 +748,44 @@ def _run_audio_only_copy_video(
     return output_path
 
 
-def _maybe_run_audio_only_path(args: argparse.Namespace) -> bool:
-    if not args.add_stereo_downmix_copy_video:
+def _maybe_run_audio_only_path(config: EncodeConfig) -> bool:
+    if not config.add_stereo_downmix_copy_video:
         return False
-    predicted = _predict_output_path(args)
+    predicted = _predict_output_path(config)
     if predicted and os.path.exists(predicted):
         print(f"Skipping (output exists): {predicted}")
         logging.info("Skipping (output exists): %s", predicted)
         return True
-    args.add_stereo_downmix = True
-    normalize_enabled = args.audio_normalize
+    config.add_stereo_downmix = True
+    normalize_enabled = config.audio_normalize
     if normalize_enabled and not has_filter('loudnorm'):
         print("WARNING: loudnorm filter not available; disabling audio normalization.")
         normalize_enabled = False
 
-    streams = probe_audio_streams(args.input)
+    streams = probe_audio_streams(config.input)
     audio_opts = build_audio_options(
         streams,
         normalize=normalize_enabled,
         add_stereo_downmix=True,
     )
 
-    scratch_root = _resolve_scratch_root(args.scratch_dir)
+    scratch_root = _resolve_scratch_root(config.scratch_dir)
     tmpdir = tempfile.mkdtemp(prefix="audio_copy_", dir=scratch_root)
     print(f"Scratch directory: {scratch_root}")
     logging.info("Scratch directory: %s", scratch_root)
     try:
         output_path = _run_audio_only_copy_video(
-            input_path=args.input,
+            input_path=config.input,
             audio_opts=audio_opts,
             output_dir=tmpdir,
         )
 
         dest = _resolve_output_dest(
             encoded_path=output_path,
-            source_path=args.input,
-            output_dir=getattr(args, 'output_dir', None),
-            no_suffix=getattr(args, 'no_suffix', False),
-            batch_input_dir=getattr(args, '_batch_input_dir', None),
+            source_path=config.input,
+            output_dir=config.output_dir,
+            no_suffix=config.no_suffix,
+            batch_input_dir=config.batch_input_dir,
         )
         shutil.move(output_path, dest)
         print(f"Output file created: {dest}")
@@ -879,18 +881,18 @@ def _prompt_qp_choice(
 
 
 def _resolve_source_ref_path(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     baseline_file: str,
 ) -> str:
-    skip_baseline_forced_off = args.skip_baseline and not _same_file(baseline_file, args.input)
-    if skip_baseline_forced_off and not args.use_baseline_as_source:
-        if bool(getattr(args, "batch_auto", False)):
+    skip_baseline_forced_off = config.skip_baseline and not _same_file(baseline_file, config.input)
+    if skip_baseline_forced_off and not config.use_baseline_as_source:
+        if config.batch_auto:
             print("Tip: use --use-baseline-as-source to treat the baseline as the source.")
         elif _prompt_use_baseline_as_source():
-            args.use_baseline_as_source = True
+            config.use_baseline_as_source = True
         else:
             print("Tip: use --use-baseline-as-source to treat the baseline as the source.")
-    return baseline_file if args.use_baseline_as_source else args.input
+    return baseline_file if config.use_baseline_as_source else config.input
 
 
 def _prepare_work_dirs(
@@ -915,14 +917,14 @@ def _estimate_full_size_from_samples(sample_bytes: int, percent: float) -> int:
 
 def _prepare_size_segments(
     baseline_file: str,
-    args: argparse.Namespace,
+    config: EncodeConfig,
     scratch_root: str,
 ) -> tuple[list[str], str | None]:
     segments, segments_tmpdir, _, _ = extract_sample_segments(
         baseline_file,
-        percent=args.sample_percent,
-        count=args.sample_count,
-        sampling_mode=args.sampling_mode,
+        percent=config.sample_percent,
+        count=config.sample_count,
+        sampling_mode=config.sampling_mode,
         tmp_root=scratch_root,
     )
     if not segments_tmpdir:
@@ -951,12 +953,12 @@ def _auto_sample_percent_for_duration(duration_sec: float) -> float:
     return 15.0
 
 
-def _resolve_sample_percent(args: argparse.Namespace, input_path: str) -> None:
-    raw_value = str(args.sample_percent).strip().lower()
+def _resolve_sample_percent(config: EncodeConfig, input_path: str) -> None:
+    raw_value = str(config.sample_percent).strip().lower()
     if raw_value == "auto":
         duration_sec = probe_video_duration(input_path)
         auto_percent = _auto_sample_percent_for_duration(duration_sec)
-        args.sample_percent = auto_percent
+        config.sample_percent = auto_percent
         print(
             f"Sampling config: --sample-percent auto -> {auto_percent:.1f}% "
             f"(duration {_format_duration_hms(duration_sec)})."
@@ -968,15 +970,15 @@ def _resolve_sample_percent(args: argparse.Namespace, input_path: str) -> None:
         raise ValueError("--sample-percent must be a number in (0, 100] or 'auto'.")
     if percent <= 0.0 or percent > 100.0:
         raise ValueError("--sample-percent must be in (0, 100].")
-    args.sample_percent = percent
+    config.sample_percent = percent
 
 
-def _resolve_sample_count(args: argparse.Namespace, input_path: str) -> None:
-    raw_value = str(args.sample_count).strip().lower()
+def _resolve_sample_count(config: EncodeConfig, input_path: str) -> None:
+    raw_value = str(config.sample_count).strip().lower()
     if raw_value == "auto":
         duration_sec = probe_video_duration(input_path)
         auto_count = _auto_sample_count_for_duration(duration_sec)
-        args.sample_count = auto_count
+        config.sample_count = auto_count
         print(
             f"Sampling config: --sample-count auto -> {auto_count} "
             f"(duration {_format_duration_hms(duration_sec)})."
@@ -988,7 +990,7 @@ def _resolve_sample_count(args: argparse.Namespace, input_path: str) -> None:
         raise ValueError("--sample-count must be an integer >= 1 or 'auto'.")
     if count < 1:
         raise ValueError("--sample-count must be >= 1.")
-    args.sample_count = count
+    config.sample_count = count
 
 
 def _safe_file_size(path: str) -> int | None:
@@ -998,15 +1000,15 @@ def _safe_file_size(path: str) -> int | None:
         return None
 
 
-def _resolve_crop_filter(args: argparse.Namespace, width: int, height: int) -> str | None:
+def _resolve_crop_filter(config: EncodeConfig, width: int, height: int) -> str | None:
     crop_candidate = _detect_vertical_overscan_crop(width, height)
     if not crop_candidate:
         return None
     expected = crop_candidate[0]
     apply_crop = False
-    if args.auto_crop == "force":
+    if config.auto_crop == "force":
         apply_crop = True
-    elif args.auto_crop == "prompt":
+    elif config.auto_crop == "prompt":
         if sys.stdin.isatty():
             apply_crop = _prompt_vertical_crop(width, height, expected)
         else:
@@ -1018,9 +1020,9 @@ def _resolve_crop_filter(args: argparse.Namespace, width: int, height: int) -> s
         return None
     crop_filter = f"crop=iw:{expected}:0:(ih-{expected})/2"
     print(f"Auto-crop enabled: {width}x{height} → {width}x{expected} (centered).")
-    if args.skip_baseline:
+    if config.skip_baseline:
         print("Auto-crop requires baseline generation; disabling --skip-baseline.")
-        args.skip_baseline = False
+        config.skip_baseline = False
     return crop_filter
 
 
@@ -1047,16 +1049,16 @@ def _is_square_sar(sample_aspect_ratio: str) -> bool:
 
 
 def _resolve_resize_filter(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     width: int,
     height: int,
     display_ar: float,
     sample_aspect_ratio: str,
 ) -> str | None:
-    if not args.resize_resolution:
+    if not config.resize_resolution:
         return None
-    label = str(args.resize_resolution).lower()
-    aspect_mode_raw = str(getattr(args, "display_ar", "auto") or "auto").lower()
+    label = str(config.resize_resolution).lower()
+    aspect_mode_raw = str(config.display_ar or "auto").lower()
     aspect_alias = {
         "4:3": "full",
         "16:9": "wide",
@@ -1133,11 +1135,11 @@ def _merge_video_filters(*filters: str | None) -> str | None:
 
 
 def _resolve_quality_mode(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     input_path: str,
 ) -> str | None:
     codec = probe_video_codec(input_path)
-    if bool(getattr(args, "batch_force_fixed_qp_mode", False)):
+    if config.batch_force_fixed_qp_mode:
         print("Quality metric in use: fixed QP (batch peer mode)")
         return codec
     if not has_filter('ssim'):
@@ -1180,10 +1182,10 @@ def _next_lower_tier(tier: str) -> str | None:
     return _TIER_ORDER[idx + 1] if idx + 1 < len(_TIER_ORDER) else None
 
 
-def _selected_quality_label(args: argparse.Namespace) -> str | None:
-    if not args.source_quality:
+def _selected_quality_label(config: EncodeConfig) -> str | None:
+    if not config.source_quality:
         return None
-    text = str(args.source_quality).strip().lower()
+    text = str(config.source_quality).strip().lower()
     if _quality_label_to_qp(text) is not None:
         return text.replace("_", "-").replace(" ", "-")
     return None
@@ -1214,13 +1216,13 @@ def _compute_source_advice(
 
 
 def _maybe_print_expected_mode_advice(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     input_path: str,
     width: int,
     height: int,
     raw_fr: float,
 ) -> None:
-    if not _expected_mode_requested(args):
+    if not _expected_mode_requested(config):
         return
     if raw_fr <= 0:
         return
@@ -1230,7 +1232,7 @@ def _maybe_print_expected_mode_advice(
         height=height,
         raw_fr=raw_fr,
     )
-    selected = _selected_quality_label(args)
+    selected = _selected_quality_label(config)
 
     print(
         "Source profile: "
@@ -1254,8 +1256,8 @@ def _maybe_print_expected_mode_advice(
         )
 
 
-def _expected_mode_requested(args: argparse.Namespace) -> bool:
-    return bool(args.source_quality)
+def _expected_mode_requested(config: EncodeConfig) -> bool:
+    return bool(config.source_quality)
 
 
 def _default_choice_for_tier(tier: str) -> str:
@@ -1324,22 +1326,22 @@ def _resolve_source_quality_choice(default_choice: str) -> str | None:
         print("Please choose 1, 2, 3, 4, 5, 6, or q.")
 
 
-def _ensure_source_quality_for_default_pipeline(args: argparse.Namespace) -> bool:
-    if _expected_mode_requested(args):
+def _ensure_source_quality_for_default_pipeline(config: EncodeConfig) -> bool:
+    if _expected_mode_requested(config):
         return True
-    if bool(getattr(args, "batch_auto", False)):
+    if config.batch_auto:
         return True
     if not sys.stdin.isatty():
-        args.source_quality = "medium"
+        config.source_quality = "medium"
         print("No --source-quality provided; defaulting to 'medium' in non-interactive mode.")
         return True
 
-    vinfo = probe_video_stream_info(args.input)
+    vinfo = probe_video_stream_info(config.input)
     width = int(vinfo.get("width", 0) or 0)
     height = int(vinfo.get("height", 0) or 0)
-    fps = probe_video_framerate(args.input)
+    fps = probe_video_framerate(config.input)
     _codec, advised, _bitrate_kbps, _bppf = _compute_source_advice(
-        input_path=args.input,
+        input_path=config.input,
         width=width,
         height=height,
         raw_fr=fps,
@@ -1350,7 +1352,7 @@ def _ensure_source_quality_for_default_pipeline(args: argparse.Namespace) -> boo
     selected = _resolve_source_quality_choice(default_choice)
     if selected is None:
         return False
-    args.source_quality = selected
+    config.source_quality = selected
     return True
 
 
@@ -1359,8 +1361,8 @@ def _quality_label_to_qp(label: str) -> int | None:
     return _QP_FOR_TIER.get(key)
 
 
-def _resolve_expected_start_qp(args: argparse.Namespace) -> int:
-    token = args.source_quality
+def _resolve_expected_start_qp(config: EncodeConfig) -> int:
+    token = config.source_quality
     if token is None:
         raise ValueError("Expected mode requested without source quality or expected qp.")
 
@@ -1376,18 +1378,18 @@ def _resolve_expected_start_qp(args: argparse.Namespace) -> int:
             raise ValueError(
                 "Invalid --source-quality value. Use QP integer or one of: ultra, high, medium, low, lower."
             ) from exc
-    if start_qp < args.min_qp:
+    if start_qp < config.min_qp:
         print(
-            f"WARNING: expected start QP {start_qp} is below --min-qp {args.min_qp}; "
+            f"WARNING: expected start QP {start_qp} is below --min-qp {config.min_qp}; "
             "lowering min-qp to match."
         )
-        args.min_qp = start_qp
-    if start_qp > args.max_qp:
+        config.min_qp = start_qp
+    if start_qp > config.max_qp:
         print(
-            f"WARNING: expected start QP {start_qp} is above --max-qp {args.max_qp}; "
+            f"WARNING: expected start QP {start_qp} is above --max-qp {config.max_qp}; "
             "raising max-qp to match."
         )
-        args.max_qp = start_qp
+        config.max_qp = start_qp
     return start_qp
 
 
@@ -1663,7 +1665,7 @@ def _parse_expected_custom_qps(raw: str, available_qps: set[int]) -> list[int] |
 
 
 def _choose_expected_qps(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     rows: List[Dict[str, Any]],
     safe_qp: int,
     balanced_qp: int,
@@ -1681,9 +1683,9 @@ def _choose_expected_qps(
     print(f"  [2] Balanced: QP={balanced_qp}, {size_label}={balanced_size:.2f} MB")
     print("  [3] Custom QP(s): enter ladder QPs and/or ranges (comma or slash separated)")
 
-    if args.expected_choice == "safe":
+    if config.expected_choice == "safe":
         return [safe_qp]
-    if args.expected_choice == "balanced":
+    if config.expected_choice == "balanced":
         return [balanced_qp]
     if not sys.stdin.isatty():
         return [safe_qp]
@@ -1704,7 +1706,7 @@ def _choose_expected_qps(
 
 
 def _run_expected_qp_mode(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     baseline_file: str,
     source_ref_path: str,
     audio_opts: List[str],
@@ -1714,20 +1716,20 @@ def _run_expected_qp_mode(
     video_codec: str,
     scratch_root: str,
 ) -> tuple[str, int, float | None, list[str]]:
-    start_qp = _resolve_expected_start_qp(args)
+    start_qp = _resolve_expected_start_qp(config)
     print(
         "Expected-QP mode: "
-        f"start QP={start_qp}, min_gain={args.expected_min_gain:.2f}%, "
-        f"max_steps={args.expected_max_steps}, knee_ratio={args.expected_knee_ratio:.2f}"
+        f"start QP={start_qp}, min_gain={config.expected_min_gain:.2f}%, "
+        f"max_steps={config.expected_max_steps}, knee_ratio={config.expected_knee_ratio:.2f}"
     )
     source_base, source_ext = os.path.splitext(os.path.basename(source_ref_path))
-    max_qp = min(args.max_qp, start_qp + max(0, args.expected_max_steps))
-    max_qp_hard = min(args.max_qp, 40)
+    max_qp = min(config.max_qp, start_qp + max(0, config.expected_max_steps))
+    max_qp_hard = min(config.max_qp, 40)
 
     # Rows and segments are preserved across tier retries via BatchOutputLargerThanSourceError.
-    precomputed_rows: list[dict] | None = getattr(args, 'batch_precomputed_rows', None)
-    precomputed_segs: list[str] | None = getattr(args, 'batch_precomputed_segments', None)
-    precomputed_segs_tmpdir: str | None = getattr(args, 'batch_precomputed_segments_tmpdir', None)
+    precomputed_rows: list[dict] | None = config.batch_precomputed_rows
+    precomputed_segs: list[str] | None = config.batch_precomputed_segments
+    precomputed_segs_tmpdir: str | None = config.batch_precomputed_segments_tmpdir
     if precomputed_segs is not None:
         segments: list[str] = precomputed_segs
         segments_tmpdir: str | None = precomputed_segs_tmpdir
@@ -1735,14 +1737,14 @@ def _run_expected_qp_mode(
     else:
         segments, segments_tmpdir = _prepare_size_segments(
             baseline_file=baseline_file,
-            args=args,
+            config=config,
             scratch_root=scratch_root,
         )
         own_segments = True
 
     try:
         rows: List[Dict[str, Any]] = _build_expected_rows_sample(
-            args=args,
+            config=config,
             baseline_file=baseline_file,
             raw_fr=raw_fr,
             gop=gop,
@@ -1773,7 +1775,7 @@ def _run_expected_qp_mode(
                 adaptive_max_qp = max_qp_hard
                 print(f"Adaptive ladder extending: QP {current_max_qp + 1}..{adaptive_max_qp}")
                 rows = _extend_expected_rows_sample_raw(
-                    args=args,
+                    config=config,
                     baseline_file=baseline_file,
                     raw_fr=raw_fr,
                     gop=gop,
@@ -1799,14 +1801,14 @@ def _run_expected_qp_mode(
         _print_expected_qp_ladder(rows)
         safe_qp, balanced_qp = _suggest_expected_qps(
             rows=rows,
-            min_gain_pct=args.expected_min_gain,
-            knee_ratio=args.expected_knee_ratio,
+            min_gain_pct=config.expected_min_gain,
+            knee_ratio=config.expected_knee_ratio,
             use_raw_metric=use_raw_metric,
         )
-        src_codec = probe_video_codec(args.input)
-        src_size = _safe_file_size(args.input) or 0
+        src_codec = probe_video_codec(config.input)
+        src_size = _safe_file_size(config.input) or 0
         selected_qps = _choose_expected_qps(
-            args=args,
+            config=config,
             rows=rows,
             safe_qp=safe_qp,
             balanced_qp=balanced_qp,
@@ -1826,7 +1828,7 @@ def _run_expected_qp_mode(
         # retry that would re-measure all the same QP levels from scratch.
         # Only raise BatchOutputLargerThanSourceError (triggering a tier drop) when no
         # row in the current ladder can produce an output small enough.
-        batch_size_limit: int | None = getattr(args, "batch_heuristic_size_limit", None)
+        batch_size_limit: int | None = config.batch_heuristic_size_limit
         if batch_size_limit is not None:
             selected_row = next((r for r in rows if r["qp"] == selected_qp), None)
             if selected_row is not None:
@@ -1875,7 +1877,7 @@ def _run_expected_qp_mode(
                 gop=gop,
                 video_codec=video_codec,
                 return_ssim=False,
-                ssim_chunk_seconds=args.full_ssim_chunk_seconds,
+                ssim_chunk_seconds=config.full_ssim_chunk_seconds,
                 output_dir=tmpdir,
                 output_base=source_base,
                 output_ext=source_ext,
@@ -1895,7 +1897,7 @@ def _run_expected_qp_mode(
 
 
 def _build_expected_rows_sample(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     baseline_file: str,
     raw_fr: float,
     gop: int,
@@ -1942,7 +1944,7 @@ def _build_expected_rows_sample(
     if own_segments:
         segments, segments_tmpdir = _prepare_size_segments(
             baseline_file=baseline_file,
-            args=args,
+            config=config,
             scratch_root=scratch_root,
         )
     if not segments:
@@ -1973,7 +1975,7 @@ def _build_expected_rows_sample(
                 prev_tail_drop = tail_drop
                 effective_metric = max(0.0, baseline_metric - tail_drop)
             sample_bytes = _sample_encoded_sizes(segments)
-            size_bytes = _estimate_full_size_from_samples(sample_bytes, args.sample_percent)
+            size_bytes = _estimate_full_size_from_samples(sample_bytes, config.sample_percent)
             rows.append({
                 "qp": qp,
                 "ssim": float(effective_metric),
@@ -1994,7 +1996,7 @@ def _build_expected_rows_sample(
 
 
 def _extend_expected_rows_sample_raw(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     baseline_file: str,
     raw_fr: float,
     gop: int,
@@ -2013,7 +2015,7 @@ def _extend_expected_rows_sample_raw(
     if own_segments:
         segments, segments_tmpdir = _prepare_size_segments(
             baseline_file=baseline_file,
-            args=args,
+            config=config,
             scratch_root=scratch_root,
         )
     if not segments:
@@ -2030,7 +2032,7 @@ def _extend_expected_rows_sample_raw(
             )
             sample_metric = mean(sample_vals) if sample_vals else 0.0
             sample_bytes = _sample_encoded_sizes(segments)
-            size_bytes = _estimate_full_size_from_samples(sample_bytes, args.sample_percent)
+            size_bytes = _estimate_full_size_from_samples(sample_bytes, config.sample_percent)
             rows.append({
                 "qp": qp,
                 "ssim": float(sample_metric),
@@ -2062,66 +2064,66 @@ def _print_expected_step_progress(rows: List[Dict[str, Any]], estimate: bool) ->
 
 
 def _prepare_baseline_and_source(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     extra_vf: str | None,
     baseline_tmp: str,
     video_codec: str,
 ) -> tuple[str, str]:
     baseline_file = _determine_baseline_file(
-        input_path=args.input,
-        skip_baseline=args.skip_baseline,
+        input_path=config.input,
+        skip_baseline=config.skip_baseline,
         baseline_tmp=baseline_tmp,
-        baseline_qp=args.baseline_qp,
+        baseline_qp=config.baseline_qp,
         extra_vf=extra_vf,
         video_codec=video_codec,
-        skip_baseline_requested=bool(getattr(args, "skip_baseline_requested", False)),
-        allow_skip_with_filters=bool(getattr(args, "batch_force_fixed_qp_mode", False)),
+        skip_baseline_requested=config.skip_baseline_requested,
+        allow_skip_with_filters=config.batch_force_fixed_qp_mode,
     )
-    source_ref_path = _resolve_source_ref_path(args, baseline_file)
+    source_ref_path = _resolve_source_ref_path(config, baseline_file)
     return baseline_file, source_ref_path
 
 
 def _prepare_main_context(
-    args: argparse.Namespace,
+    config: EncodeConfig,
 ) -> tuple[str | None, str, List[str], float]:
-    width, height, pix_fmt, display_ar, sar_text, _dar_text = _probe_video_basics(args.input)
-    _resolve_sample_percent(args, args.input)
-    _resolve_sample_count(args, args.input)
+    width, height, pix_fmt, display_ar, sar_text, _dar_text = _probe_video_basics(config.input)
+    _resolve_sample_percent(config, config.input)
+    _resolve_sample_count(config, config.input)
 
-    if args.video_codec == "h264":
-        if not _confirm_h264_compat(width, height, pix_fmt, decision=args.h264_compat):
+    if config.video_codec == "h264":
+        if not _confirm_h264_compat(width, height, pix_fmt, decision=config.h264_compat):
             raise RuntimeError("aborted_h264_compat")
 
-    crop_filter = _resolve_crop_filter(args, width, height)
+    crop_filter = _resolve_crop_filter(config, width, height)
     resize_filter = _resolve_resize_filter(
-        args,
+        config,
         width,
         height,
         display_ar=display_ar,
         sample_aspect_ratio=sar_text,
     )
     extra_vf = _merge_video_filters(crop_filter, resize_filter)
-    _maybe_enable_default_skip_baseline(args, args.input, extra_vf)
-    if not _ensure_source_quality_for_default_pipeline(args):
+    _maybe_enable_default_skip_baseline(config, config.input, extra_vf)
+    if not _ensure_source_quality_for_default_pipeline(config):
         raise RuntimeError("cancelled")
 
-    codec = _resolve_quality_mode(args, args.input)
+    codec = _resolve_quality_mode(config, config.input)
     if codec is None:
         raise RuntimeError("invalid_quality_mode")
 
-    audio_opts, source_fr, args.audio_normalize = _prepare_audio_and_framerate(
-        args.input, args.audio_normalize, args.add_stereo_downmix
+    audio_opts, source_fr, config.audio_normalize = _prepare_audio_and_framerate(
+        config.input, config.audio_normalize, config.add_stereo_downmix
     )
-    raw_fr = _resolve_target_framerate(source_fr, args.target_fps)
+    raw_fr = _resolve_target_framerate(source_fr, config.target_fps)
     _maybe_print_expected_mode_advice(
-        args=args,
-        input_path=args.input,
+        config=config,
+        input_path=config.input,
         width=width,
         height=height,
         raw_fr=source_fr,
     )
-    _stem = os.path.splitext(os.path.basename(args.input))[0]
-    _raw_ext = os.path.splitext(args.input)[1].lower()
+    _stem = os.path.splitext(os.path.basename(config.input))[0]
+    _raw_ext = os.path.splitext(config.input)[1].lower()
     _out_ext = _raw_ext if _raw_ext == ".mp4" else ".mkv"
     check_output_filename_length(
         stem=_stem,
@@ -2134,75 +2136,73 @@ def _prepare_main_context(
 
 
 def _run_transcode_pipeline(
-    args: argparse.Namespace,
+    config: EncodeConfig,
     extra_vf: str | None,
     codec: str,
     audio_opts: List[str],
     raw_fr: float,
 ) -> tuple[str, int]:
-    scratch_root = _resolve_scratch_root(args.scratch_dir)
+    scratch_root = _resolve_scratch_root(config.scratch_dir)
     baseline_tmp, tmpdir, samples_tmpdir = _prepare_work_dirs(
-        scratch_root, args.input, args.skip_baseline
+        scratch_root, config.input, config.skip_baseline
     )
     # When handing off baseline ownership to caller on BatchOutputLargerThanSourceError,
     # skip deletion of baseline_tmp in finally so the next retry can reuse it.
     _baseline_tmp_owned = True
-    precomputed_baseline: str | None = getattr(args, "batch_precomputed_baseline_file", None)
-    baseline_file: str = args.input  # safe default; overwritten below before use
+    precomputed_baseline: str | None = config.batch_precomputed_baseline_file
+    baseline_file: str = config.input  # safe default; overwritten below before use
 
     try:
         if precomputed_baseline:
             baseline_file = precomputed_baseline
-            source_ref_path = _resolve_source_ref_path(args, baseline_file)
+            source_ref_path = _resolve_source_ref_path(config, baseline_file)
         else:
             baseline_file, source_ref_path = _prepare_baseline_and_source(
-                args=args,
+                config=config,
                 extra_vf=extra_vf,
                 baseline_tmp=baseline_tmp,
-                video_codec=args.video_codec,
+                video_codec=config.video_codec,
             )
 
         gop = _calculate_gop(raw_fr)
         extra_final_files: list[str] = []
 
-        if getattr(args, 'batch_force_fixed_qp_mode', False):
+        if config.batch_force_fixed_qp_mode:
             source_base, source_ext = os.path.splitext(os.path.basename(source_ref_path))
             final_file = cast(str, encode_final(
                 input_file=baseline_file,
-                qp=args.initial_qp,
+                qp=config.initial_qp,
                 audio_opts=audio_opts,
                 raw_fr=raw_fr,
                 gop=gop,
-                video_codec=args.video_codec,
+                video_codec=config.video_codec,
                 return_ssim=False,
-                ssim_chunk_seconds=getattr(args, 'full_ssim_chunk_seconds', None),
+                ssim_chunk_seconds=config.full_ssim_chunk_seconds,
                 output_dir=tmpdir,
                 output_base=source_base,
                 output_ext=source_ext,
             ))
-            final_qp = args.initial_qp
+            final_qp = config.initial_qp
         else:
             final_file, final_qp, _final_full_ssim, extra_final_files = _run_expected_qp_mode(
-                args=args,
+                config=config,
                 baseline_file=baseline_file,
                 source_ref_path=source_ref_path,
                 audio_opts=audio_opts,
                 raw_fr=raw_fr,
                 gop=gop,
                 tmpdir=tmpdir,
-                video_codec=args.video_codec,
+                video_codec=config.video_codec,
                 scratch_root=scratch_root,
             )
 
         final_path: str = final_file
-        _out_dir = getattr(args, 'output_dir', None)
-        _batch_root = getattr(args, '_batch_input_dir', None)
         dest: str = _resolve_output_dest(
             encoded_path=final_path,
-            source_path=args.input,
-            output_dir=_out_dir,
-            no_suffix=getattr(args, 'no_suffix', False),
-            batch_input_dir=_batch_root,
+            source_path=config.input,
+            output_dir=config.output_dir,
+            no_suffix=config.no_suffix,
+            batch_input_dir=config.batch_input_dir,
         )
 
         shutil.move(final_path, dest)
@@ -2211,10 +2211,10 @@ def _run_transcode_pipeline(
         for extra_path in extra_final_files:
             extra_dest = _resolve_output_dest(
                 encoded_path=extra_path,
-                source_path=args.input,
-                output_dir=_out_dir,
+                source_path=config.input,
+                output_dir=config.output_dir,
                 no_suffix=False,
-                batch_input_dir=_batch_root,
+                batch_input_dir=config.batch_input_dir,
             )
             shutil.move(extra_path, extra_dest)
             print(f"Additional output: {extra_dest}")
@@ -2436,32 +2436,32 @@ def _print_batch_excluded_summary(
         )
 
 
-def _predict_output_path(args: argparse.Namespace) -> str | None:
+def _predict_output_path(config: EncodeConfig) -> str | None:
     """Compute the expected output path when --output-dir + --no-suffix are active, else None."""
-    if not (getattr(args, 'output_dir', None) and getattr(args, 'no_suffix', False)):
+    if not (config.output_dir and config.no_suffix):
         return None
-    src_ext = os.path.splitext(args.input)[1].lower()
+    src_ext = os.path.splitext(config.input)[1].lower()
     enc_ext = src_ext if src_ext in {'.mp4', '.mkv'} else '.mkv'
-    dummy_name = os.path.splitext(os.path.basename(args.input))[0] + enc_ext
+    dummy_name = os.path.splitext(os.path.basename(config.input))[0] + enc_ext
     return _resolve_output_dest(
         encoded_path=dummy_name,
-        source_path=args.input,
-        output_dir=args.output_dir,
+        source_path=config.input,
+        output_dir=config.output_dir,
         no_suffix=True,
-        batch_input_dir=getattr(args, '_batch_input_dir', None),
+        batch_input_dir=config.batch_input_dir,
     )
 
 
-def _run_single_file_pipeline(args: argparse.Namespace) -> tuple[str, int]:
-    predicted = _predict_output_path(args)
+def _run_single_file_pipeline(config: EncodeConfig) -> tuple[str, int]:
+    predicted = _predict_output_path(config)
     if predicted and os.path.exists(predicted):
         print(f"Skipping (output exists): {predicted}")
         logging.info("Skipping (output exists): %s", predicted)
         return predicted, -1
-    args.skip_baseline_requested = bool(args.skip_baseline)
-    extra_vf, codec, audio_opts, raw_fr = _prepare_main_context(args)
+    config.skip_baseline_requested = bool(config.skip_baseline)
+    extra_vf, codec, audio_opts, raw_fr = _prepare_main_context(config)
     return _run_transcode_pipeline(
-        args=args,
+        config=config,
         extra_vf=extra_vf,
         codec=codec,
         audio_opts=audio_opts,
@@ -2469,16 +2469,16 @@ def _run_single_file_pipeline(args: argparse.Namespace) -> tuple[str, int]:
     )
 
 
-def _run_batch_auto(args: argparse.Namespace) -> None:
-    if not os.path.isdir(args.input):
+def _run_batch_auto(config: EncodeConfig) -> None:
+    if not os.path.isdir(config.input):
         raise ValueError("--batch-auto requires the input path to be a directory.")
 
-    if args.auto_crop == "prompt":
+    if config.auto_crop == "prompt":
         print("Batch mode: forcing --auto-crop off to avoid interactive prompts.")
-        args.auto_crop = "off"
-    args.expected_choice = "safe"
+        config.auto_crop = "off"
+    config.expected_choice = "safe"
 
-    all_files = _list_video_files(args.input)
+    all_files = _list_video_files(config.input)
     if not all_files:
         print("No supported video files found.")
         return
@@ -2493,11 +2493,11 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         print("No readable video profiles found.")
         return
 
-    target_codec = normalize_video_codec(args.video_codec)
+    target_codec = normalize_video_codec(config.video_codec)
     included: list[Dict[str, Any]] = []
     excluded: list[Dict[str, Any]] = []
     for p in profiles:
-        if not args.re_encode_same_codec_video and p["codec"] == target_codec:
+        if not config.re_encode_same_codec_video and p["codec"] == target_codec:
             excluded.append(p)
         else:
             included.append(p)
@@ -2513,18 +2513,18 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
 
     clusters = _cluster_videos_for_batch(
         included,
-        bppf_tolerance=args.batch_bppf_tolerance,
-        bitrate_tolerance=args.batch_bitrate_tolerance,
+        bppf_tolerance=config.batch_bppf_tolerance,
+        bitrate_tolerance=config.batch_bitrate_tolerance,
     )
     if not clusters:
         print("No clusters produced from batch scan.")
         return
 
-    _print_batch_cluster_summary(clusters, args.input)
-    if args.batch_dry_run:
+    _print_batch_cluster_summary(clusters, config.input)
+    if config.batch_dry_run:
         _print_batch_excluded_summary(
             excluded=excluded,
-            root=args.input,
+            root=config.input,
             reason=f"source codec matches target codec '{target_codec}'",
         )
         print("\nBatch dry run enabled; no encodes were started.")
@@ -2538,11 +2538,11 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         print(f"\n[Cluster {cluster['id']}] Sampling representative: {rep_path}")
 
         # Track whether the tier was auto-detected so we know whether to retry.
-        heuristic_tier = not bool(args.source_quality)
+        heuristic_tier = not bool(config.source_quality)
         initial_tier = (
             _tier_for_bppf(str(rep["codec"]), float(rep["bppf"]))
             if heuristic_tier
-            else str(args.source_quality)
+            else str(config.source_quality)
         )
 
         cluster_dest: str | None = None
@@ -2556,17 +2556,16 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
         batch_rows: list[dict] = []
 
         while True:
-            rep_args = argparse.Namespace(**vars(args))
-            rep_args.input = rep_path
-            rep_args._batch_input_dir = args.input
-            rep_args.source_quality = current_tier
-            if batch_baseline_file:
-                rep_args.batch_precomputed_baseline_file = batch_baseline_file
-            if batch_segments:
-                rep_args.batch_precomputed_segments = batch_segments
-                rep_args.batch_precomputed_segments_tmpdir = batch_segments_tmpdir
-            if batch_rows:
-                rep_args.batch_precomputed_rows = batch_rows
+            rep_config = dataclasses.replace(
+                config,
+                input=rep_path,
+                batch_input_dir=config.input,
+                source_quality=current_tier,
+                batch_precomputed_baseline_file=batch_baseline_file or None,
+                batch_precomputed_segments=batch_segments or None,
+                batch_precomputed_segments_tmpdir=batch_segments_tmpdir if batch_segments else None,
+                batch_precomputed_rows=batch_rows or None,
+            )
             if heuristic_tier:
                 print(
                     f"[Cluster {cluster['id']}] No --source-quality provided; "
@@ -2574,19 +2573,22 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
                 )
                 # Pass source size to the pipeline only when the guard is enabled
                 # and a lower tier exists to fall back to.
-                if args.batch_size_guard and _next_lower_tier(current_tier) is not None:
+                if config.batch_size_guard and _next_lower_tier(current_tier) is not None:
                     try:
-                        rep_args.batch_heuristic_size_limit = os.path.getsize(rep_path)
+                        rep_config = dataclasses.replace(
+                            rep_config,
+                            batch_heuristic_size_limit=os.path.getsize(rep_path),
+                        )
                     except OSError:
                         pass
 
             try:
-                cluster_dest, cluster_qp = _run_single_file_pipeline(rep_args)
+                cluster_dest, cluster_qp = _run_single_file_pipeline(rep_config)
                 # Verify actual output size — the pre-flight estimate may have passed
                 # or been skipped (user-specified tier), but the real encode can still
                 # be larger than the source.
                 if (
-                    args.batch_size_guard
+                    config.batch_size_guard
                     and cluster_qp is not None
                     and cluster_qp >= 0  # not a skip sentinel
                     and cluster_dest
@@ -2660,17 +2662,19 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
             if _same_file(member_path, rep_path):
                 continue
             print(f"[Cluster {cluster['id']}] Re-encoding with fixed QP={cluster_qp}: {member_path}")
-            member_args = argparse.Namespace(**vars(args))
-            member_args.input = member_path
-            member_args._batch_input_dir = args.input
-            member_args.source_quality = None
-            member_args.initial_qp = int(cluster_qp)
-            member_args.skip_baseline = True
-            member_args.batch_force_fixed_qp_mode = True
+            member_config = dataclasses.replace(
+                config,
+                input=member_path,
+                batch_input_dir=config.input,
+                source_quality=None,
+                initial_qp=int(cluster_qp),
+                skip_baseline=True,
+                batch_force_fixed_qp_mode=True,
+            )
             try:
-                _member_dest, _member_qp = _run_single_file_pipeline(member_args)
+                _member_dest, _member_qp = _run_single_file_pipeline(member_config)
                 if (
-                    args.batch_size_guard
+                    config.batch_size_guard
                     and _member_qp >= 0  # not a skip sentinel
                     and _member_dest
                     and os.path.exists(_member_dest)
@@ -2694,7 +2698,7 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
 
     _print_batch_excluded_summary(
         excluded=excluded,
-        root=args.input,
+        root=config.input,
         reason=f"source codec matches target codec '{target_codec}'",
     )
     print(f"\nBatch mode complete. Processed {processed} file(s).")
@@ -2703,41 +2707,42 @@ def _run_batch_auto(args: argparse.Namespace) -> None:
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
-    args.skip_baseline_requested = bool(args.skip_baseline)
-    args.video_codec = normalize_video_codec(args.video_codec)
+    config = config_from_args(args)
+    config.video_codec = normalize_video_codec(config.video_codec)
+    config.skip_baseline_requested = bool(config.skip_baseline)
 
     # ------------------------------------------------------------
     # Logging setup
     # ------------------------------------------------------------
-    setup_logging(args.verbose, args.log_file)
+    setup_logging(config.verbose, config.log_file)
 
-    if args.use_baseline_as_source and args.skip_baseline:
+    if config.use_baseline_as_source and config.skip_baseline:
         print("WARNING: --use-baseline-as-source requires a baseline; ignoring --skip-baseline.")
-        args.skip_baseline = False
-    if args.no_suffix and not args.output_dir:
+        config.skip_baseline = False
+    if config.no_suffix and not config.output_dir:
         parser.error("--no-suffix requires --output-dir")
 
-    if args.batch_auto:
+    if config.batch_auto:
         try:
-            _run_batch_auto(args)
+            _run_batch_auto(config)
         except ValueError as exc:
             print(f"ERROR: {exc}")
         return
 
-    if not os.path.isfile(args.input):
-        logging.error("Input file not found: %s", args.input)
+    if not os.path.isfile(config.input):
+        logging.error("Input file not found: %s", config.input)
         return
 
-    _print_source_profile(args.input)
+    _print_source_profile(config.input)
 
     # ------------------------------------------------------------
     # Audio-only path: copy video, process audio, skip SSIM pipeline
     # ------------------------------------------------------------
-    if _maybe_run_audio_only_path(args):
+    if _maybe_run_audio_only_path(config):
         return
 
     try:
-        _run_single_file_pipeline(args)
+        _run_single_file_pipeline(config)
     except ValueError as exc:
         print(f"ERROR: {exc}")
         return

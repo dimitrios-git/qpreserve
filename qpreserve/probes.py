@@ -64,7 +64,9 @@ def detect_hdr(input_file: str) -> Dict[str, Any]:
             "is_hdr": True/False,
             "primaries": "...",
             "transfer": "...",
-            "matrix": "..."
+            "matrix": "...",
+            "height": int,      # for the SD/HD default when the tags are missing
+            "fps": float,
         }
     """
     data = _probe(
@@ -72,7 +74,7 @@ def detect_hdr(input_file: str) -> Dict[str, Any]:
         ['ffprobe', '-v', 'quiet',
          '-select_streams', 'v:0',
          '-show_entries',
-         'stream=color_primaries,color_transfer,color_space',
+         'stream=color_primaries,color_transfer,color_space,height,r_frame_rate',
          '-of', 'json',
          input_file]
     )
@@ -91,11 +93,19 @@ def detect_hdr(input_file: str) -> Dict[str, Any]:
         mat in ('bt2020nc', 'bt2020c')
     )
 
+    try:
+        num, den = (st.get('r_frame_rate') or '0/1').split('/')
+        fps = int(num) / int(den) if int(den) else 0.0
+    except ValueError:
+        fps = 0.0
+
     return {
         "is_hdr": is_hdr,
         "primaries": prim,
         "transfer": tr,
-        "matrix": mat
+        "matrix": mat,
+        "height": int(st.get('height', 0) or 0),
+        "fps": fps,
     }
 
 

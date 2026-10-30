@@ -42,14 +42,23 @@ def _build_resolved_color_meta(hdr_info: Dict[str, Any]) -> Dict[str, Any]:
     }
     tr = tr_aliases.get(tr, tr)
 
+    # An untagged source is shown by players with the default for its size: BT.601 below
+    # 720 lines, BT.709 above. The pixels are not converted here (the SDR path only labels
+    # them), so the label must be the one the source was already being decoded with.
+    # Labelling SD BT.709 shifts its colours (reds, greens and skin tones come out duller).
+    height = int(hdr_info.get("height") or 0)
+    sd = 0 < height < 720
+    pal = abs(float(hdr_info.get("fps") or 0) - 25) < 0.5 or abs(float(hdr_info.get("fps") or 0) - 50) < 0.5
+    sd_name = "bt470bg" if pal else "smpte170m"   # 625-line (PAL) or 525-line (NTSC) BT.601
+
     if prim in unknown_tokens:
-        prim = "bt2020" if hdr_info.get("is_hdr") else "bt709"
+        prim = "bt2020" if hdr_info.get("is_hdr") else (sd_name if sd else "bt709")
         filled_unknown = True
     if tr in unknown_tokens:
-        tr = "smpte2084" if hdr_info.get("is_hdr") else "bt709"
+        tr = "smpte2084" if hdr_info.get("is_hdr") else ("smpte170m" if sd else "bt709")
         filled_unknown = True
     if mat in unknown_tokens:
-        mat = "bt2020nc" if hdr_info.get("is_hdr") else "bt709"
+        mat = "bt2020nc" if hdr_info.get("is_hdr") else (sd_name if sd else "bt709")
         filled_unknown = True
 
     return {
@@ -446,8 +455,24 @@ def build_hdr_sdr_filter(hdr: Dict[str, Any]) -> str | None:
 def _build_bt709_tag_filter() -> str:
     """
     Force SDR BT.709 color metadata onto frames so outputs have complete tags.
+    Right only for frames that ARE BT.709 (HD, or HDR after the tone-mapping chain).
     """
     return "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+
+
+def _build_tag_filter_from_meta(meta: Dict[str, Any]) -> str:
+    """Label frames with the resolved metadata (no conversion): SD stays BT.601."""
+    return (f"setparams=colorspace={meta['matrix']}:color_primaries={meta['primaries']}"
+            f":color_trc={meta['transfer']}:range=tv")
+
+
+def _h264_color(hdr_info: Dict[str, Any], meta: Dict[str, Any]) -> tuple[str, list[str]]:
+    """(frame-tag filter, ffmpeg color args) for an H.264 output: BT.709 after the HDR->SDR
+    tone mapping, which converts into it; otherwise the source's own (resolved) label."""
+    if hdr_info.get("is_hdr"):
+        return _build_bt709_tag_filter(), ['-color_range', 'tv', '-color_primaries', 'bt709',
+                                           '-color_trc', 'bt709', '-colorspace', 'bt709']
+    return _build_tag_filter_from_meta(meta), _build_color_args_from_meta(meta)
 
 
 def _merge_filters(*filters: str | None) -> str | None:
@@ -552,15 +577,9 @@ def encode_baseline(
     bsf_filter: str | None = None
     if codec_norm == "h264":
         hdr_filter = build_hdr_sdr_filter(hdr_info)
-        tag_filter = _build_bt709_tag_filter()
+        tag_filter, color_args = _h264_color(hdr_info, color_meta)
         filter_chain = _merge_filters(hdr_filter, extra_vf, tag_filter)
-        format_args = [
-            '-pix_fmt', 'yuv420p',
-            '-color_range', 'tv',
-            '-color_primaries', 'bt709',
-            '-color_trc', 'bt709',
-            '-colorspace', 'bt709',
-        ]
+        format_args = ['-pix_fmt', 'yuv420p'] + color_args
     else:
         filter_chain = extra_vf
         pix_fmt = 'p010le' if _is_10bit_pix_fmt(source_pix_fmt) else 'yuv420p'
@@ -700,15 +719,10 @@ def encode_final(
     bsf_opts: list[str] = []
     pix_fmt = "yuv420p"
     if codec_norm == "h264":
-        filter_chain = _merge_filters(extra_vf, _build_bt709_tag_filter())
+        tag_filter, color_opts = _h264_color(hdr_info, color_meta)
+        filter_chain = _merge_filters(extra_vf, tag_filter)
         if filter_chain:
             vf_opts = ['-vf', filter_chain]
-        color_opts = [
-            '-color_range', 'tv',
-            '-color_primaries', 'bt709',
-            '-color_trc', 'bt709',
-            '-colorspace', 'bt709',
-        ]
     else:
         if extra_vf:
             vf_opts = ['-vf', extra_vf]

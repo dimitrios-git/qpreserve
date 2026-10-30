@@ -10,6 +10,7 @@ from .utils import (
     run_ffmpeg_progress,
     normalize_video_codec,
     nvenc_encoder_for,
+    nvenc_scale_vf,
     cpu_encoder_for,
     output_codec_tag,
 )
@@ -574,21 +575,24 @@ def encode_baseline(
     color_meta = _build_resolved_color_meta(hdr_info)
     source_vinfo = probe_video_stream_info(input_file)
     source_pix_fmt = str(source_vinfo.get("pix_fmt", "") or "")
+    has_user_scale = bool(extra_vf and "scale" in extra_vf)
+    scale_vf = None if has_user_scale else nvenc_scale_vf(
+        source_vinfo["width"], source_vinfo["height"], video_codec
+    )
     bsf_filter: str | None = None
     if codec_norm == "h264":
         hdr_filter = build_hdr_sdr_filter(hdr_info)
         tag_filter, color_args = _h264_color(hdr_info, color_meta)
-        filter_chain = _merge_filters(hdr_filter, extra_vf, tag_filter)
+        filter_chain = _merge_filters(hdr_filter, extra_vf, tag_filter, scale_vf)
         format_args = ['-pix_fmt', 'yuv420p'] + color_args
     else:
-        filter_chain = extra_vf
+        filter_chain = _merge_filters(extra_vf, scale_vf)
         pix_fmt = 'p010le' if _is_10bit_pix_fmt(source_pix_fmt) else 'yuv420p'
         format_args = ['-pix_fmt', pix_fmt] + _build_color_args_from_meta(color_meta)
         bsf_filter = _build_color_bsf(codec_norm, color_meta)
 
-    # Base command: map only v/a/s, ignore data/tmcd/etc.
-    base_cmd = [
-        'ffmpeg', '-y',
+    # Shared input/map/filter args — used by both NVENC and CPU fallback.
+    shared_args: List[str] = [
         '-fflags', '+discardcorrupt',
         '-i', input_file,
         '-map', '0:v',
@@ -596,13 +600,11 @@ def encode_baseline(
         '-map', '0:s?',
         '-map_metadata', '0',
     ]
-
     if filter_chain:
         if hdr_info["is_hdr"]:
             print("HDR detected → applying HDR→SDR tone mapping")
-        base_cmd += ['-vf', filter_chain]
-
-    base_cmd += format_args
+        shared_args += ['-vf', filter_chain]
+    shared_args += format_args
 
     nvenc_opts = [
         '-c:v', nvenc_encoder,
@@ -611,33 +613,20 @@ def encode_baseline(
         '-qp', str(qp),
         '-bf', '2',
     ]
+    tail = (['-bsf:v', bsf_filter] if bsf_filter else []) + ['-c:a', 'copy', '-c:s', 'copy', output]
 
     # GPU baseline (force NVENC even for low-res per user request)
-    cmd = base_cmd + nvenc_opts
-    if bsf_filter:
-        cmd += ['-bsf:v', bsf_filter]
-    cmd += [
-        '-c:a', 'copy',
-        '-c:s', 'copy',
-        output
-    ]
-
+    cmd = ['ffmpeg', '-y', '-hwaccel', 'cuda'] + shared_args + nvenc_opts + tail
     try:
         run_ffmpeg_progress(cmd, total_duration, desc="Baseline Encode")
     except subprocess.CalledProcessError as err:
         logging.warning("NVENC baseline failed (%s). Falling back to %s baseline QP.", err, cpu_encoder)
-        cpu_cmd = base_cmd + [
+        # CPU fallback uses software decode — no hwaccel.
+        cpu_cmd = ['ffmpeg', '-y'] + shared_args + [
             '-c:v', cpu_encoder,
             '-preset', 'veryslow',
             '-qp', str(qp),
-        ]
-        if bsf_filter:
-            cpu_cmd += ['-bsf:v', bsf_filter]
-        cpu_cmd += [
-            '-c:a', 'copy',
-            '-c:s', 'copy',
-            output
-        ]
+        ] + tail
         run_ffmpeg_progress(cpu_cmd, total_duration, desc="Baseline Encode (CPU)")
     return output
 
@@ -701,11 +690,15 @@ def encode_final(
     color_meta = _build_resolved_color_meta(hdr_info)
     source_vinfo = probe_video_stream_info(input_file)
     source_pix_fmt = str(source_vinfo.get("pix_fmt", "") or "")
+    has_user_scale = bool(extra_vf and "scale" in extra_vf)
+    scale_vf = None if has_user_scale else nvenc_scale_vf(
+        source_vinfo["width"], source_vinfo["height"], video_codec
+    )
 
     # Get resolution label and format framerate
     resolution = output_resolution_label or _get_resolution_label(input_file)
     fps_int = int(round(raw_fr))
-    
+
     encoder_tag = output_codec_tag(codec_norm)
     filename = f"{base} [{encoder_tag} {resolution}{fps_int} qp {qp}]{ext}"
     if output_dir:
@@ -720,12 +713,13 @@ def encode_final(
     pix_fmt = "yuv420p"
     if codec_norm == "h264":
         tag_filter, color_opts = _h264_color(hdr_info, color_meta)
-        filter_chain = _merge_filters(extra_vf, tag_filter)
+        filter_chain = _merge_filters(extra_vf, tag_filter, scale_vf)
         if filter_chain:
             vf_opts = ['-vf', filter_chain]
     else:
-        if extra_vf:
-            vf_opts = ['-vf', extra_vf]
+        combined_vf = _merge_filters(extra_vf, scale_vf)
+        if combined_vf:
+            vf_opts = ['-vf', combined_vf]
         pix_fmt = 'p010le' if _is_10bit_pix_fmt(source_pix_fmt) else 'yuv420p'
         color_opts = _build_color_args_from_meta(color_meta)
         bsf_filter = _build_color_bsf(codec_norm, color_meta)

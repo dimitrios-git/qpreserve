@@ -6,7 +6,8 @@ import tempfile
 from typing import List
 
 from .probes import probe_video_duration
-from .utils import run_cmd, nvenc_encoder_for, nvenc_pix_fmt_for
+from .utils import run_cmd, nvenc_encoder_for, nvenc_pix_fmt_for, nvenc_scale_vf
+from .probes import probe_video_stream_info
 
 from tqdm import tqdm
 
@@ -262,14 +263,26 @@ def extract_samples(
                 seg
             ])
 
+            # Probe dims and add scale filter if below NVENC minimum
+            vf_opts: list[str] = []
+            try:
+                vinfo = probe_video_stream_info(seg)
+                scale_vf = nvenc_scale_vf(vinfo["width"], vinfo["height"], video_codec)
+                if scale_vf:
+                    vf_opts = ['-vf', scale_vf]
+            except Exception:
+                pass
+
             # Encode sample with explicit stream mapping
-            run_cmd([
+            seg_cmd = [
                 'ffmpeg', '-y', '-hwaccel', 'cuda', '-fflags', '+discardcorrupt', '-i', seg,
                 '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
+            ] + vf_opts + [
                 '-r', str(raw_fr), '-g', str(int(max(1, round(raw_fr / 2)))),
                 '-bf', '2', '-pix_fmt', pix_fmt, '-c:v', nvenc_encoder,
                 '-preset', 'p7', '-rc', 'constqp', '-qp', str(sample_qp)
-            ] + audio_opts + ['-c:s', 'copy', sample_file])
+            ] + audio_opts + ['-c:s', 'copy', sample_file]
+            run_cmd(seg_cmd)
 
             samples.append(sample_file)
     except Exception:

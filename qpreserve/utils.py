@@ -208,6 +208,27 @@ def output_codec_tag(video_codec: str) -> str:
     return "hevc" if normalize_video_codec(video_codec) == "h265" else "avc"
 
 
+# hevc_nvenc requires width and height both ≥ 144; h264_nvenc allows ≥ 32.
+_NVENC_MIN_DIM: dict[str, int] = {"h265": 144, "h264": 32}
+
+
+def nvenc_scale_vf(width: int, height: int, video_codec: str) -> str | None:
+    """Return a scale= filter if either dimension is below the NVENC minimum, else None."""
+    min_dim = _NVENC_MIN_DIM.get(normalize_video_codec(video_codec), 144)
+    if width >= min_dim and height >= min_dim:
+        return None
+    scale = min_dim / min(width, height)
+    new_w = max(round(width * scale), min_dim)
+    new_h = max(round(height * scale), min_dim)
+    new_w = (new_w + 1) // 2 * 2  # NVENC requires even dimensions
+    new_h = (new_h + 1) // 2 * 2
+    logging.warning(
+        "Source %dx%d is below NVENC minimum (%dpx); upscaling to %dx%d for encode.",
+        width, height, min_dim, new_w, new_h,
+    )
+    return f"scale={new_w}:{new_h}"
+
+
 _MAX_FILENAME_BYTES = 255
 
 

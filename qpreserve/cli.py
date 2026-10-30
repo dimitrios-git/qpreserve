@@ -76,7 +76,7 @@ _RESIZE_HEIGHT_BY_LABEL: Dict[str, int] = {
 }
 
 _VIDEO_EXTENSIONS = {
-    ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".mpg", ".mpeg", ".wmv", ".flv", ".vid",
+    ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".mpg", ".mpeg", ".wmv", ".flv", ".vid", ".webm",
 }
 
 _QP_FOR_TIER: Dict[str, int] = {"ultra": 9, "high": 13, "medium": 21, "low": 25, "lower": 30}
@@ -2508,7 +2508,6 @@ def _run_single_file_pipeline(config: EncodeConfig) -> tuple[str, int]:
         print(f"Skipping (output exists): {predicted}")
         logging.info("Skipping (output exists): %s", predicted)
         return predicted, -1
-    config.skip_baseline_requested = bool(config.skip_baseline)
     extra_vf, codec, audio_opts, raw_fr = _prepare_main_context(config)
     dest, qp = _run_transcode_pipeline(
         config=config,

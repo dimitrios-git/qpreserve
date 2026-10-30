@@ -5,7 +5,8 @@ import subprocess
 from statistics import mean
 from typing import List, Sequence, Tuple
 
-from .utils import run_cmd, nvenc_encoder_for, nvenc_pix_fmt_for
+from .utils import run_cmd, nvenc_encoder_for, nvenc_pix_fmt_for, nvenc_scale_vf
+from .probes import probe_video_stream_info
 
 from tqdm import tqdm
 
@@ -56,13 +57,23 @@ def _encode_sample(
 ) -> bool:
     nvenc_encoder = nvenc_encoder_for(video_codec)
     pix_fmt = nvenc_pix_fmt_for(video_codec)
+    vf_opts: List[str] = []
     try:
-        run_cmd([
-            'ffmpeg', '-y', '-hwaccel', 'cuda', '-fflags', '+discardcorrupt', '-i', sample_file,
-            '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
-            '-r', str(raw_fr), '-g', str(gop), '-bf', '2', '-pix_fmt', pix_fmt,
-            '-c:v', nvenc_encoder, '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)
-        ] + audio_opts + ['-c:s', 'copy', temp_out])
+        vinfo = probe_video_stream_info(sample_file)
+        scale_vf = nvenc_scale_vf(vinfo["width"], vinfo["height"], video_codec)
+        if scale_vf:
+            vf_opts = ['-vf', scale_vf]
+    except Exception:
+        pass
+    cmd = [
+        'ffmpeg', '-y', '-hwaccel', 'cuda', '-fflags', '+discardcorrupt', '-i', sample_file,
+        '-map', '0:v', '-map', '0:a?', '-map', '0:s?', '-map_metadata', '0',
+    ] + vf_opts + [
+        '-r', str(raw_fr), '-g', str(gop), '-bf', '2', '-pix_fmt', pix_fmt,
+        '-c:v', nvenc_encoder, '-preset', 'p7', '-rc', 'constqp', '-qp', str(qp)
+    ] + audio_opts + ['-c:s', 'copy', temp_out]
+    try:
+        run_cmd(cmd)
     except Exception as e:
         logging.warning(
             "Sample encode failed for %s at QP=%d (%s); using SSIM=0.",

@@ -26,6 +26,7 @@ class EncodeConfig:
     # --- Quality selection ---
     initial_qp: int | None = None
     source_quality: str | None = None
+    tier_offset: int | None = None
     expected_choice: str = "prompt"
     expected_min_gain: float = 1.0
     expected_max_steps: int = 8
@@ -94,6 +95,7 @@ def config_from_args(args: argparse.Namespace) -> EncodeConfig:
         metric=args.metric,
         initial_qp=args.initial_qp,
         source_quality=args.source_quality,
+        tier_offset=args.tier_offset,
         expected_choice=args.expected_choice,
         expected_min_gain=args.expected_min_gain,
         expected_max_steps=args.expected_max_steps,

@@ -137,6 +137,7 @@ Re-running the same batch command automatically skips files whose output already
 | ------ | ------- | ----------- |
 | `--ssim` | `0.986` | Target SSIM floor for the quality ladder |
 | `--source-quality` | — | Starting QP tier for the expected-QP ladder (`ultra`, `high`, `medium`, `low`, `lower`, or a numeric QP). Prompted interactively if omitted; defaults to `medium` in non-interactive mode. |
+| `--tier-offset N` | — | Without `--source-quality`: start from the tier the source heuristic suggests, lowered by N levels (`1`: ultra→high, high→medium, …; negative raises it). Per file, and per cluster in batch mode; non-interactive single-file runs then use the heuristic instead of `medium`. |
 | `--video-codec` | `h265` | Target video codec (`h264`, `h265`/`hevc`) |
 | `--min-qp` | `6` | Minimum QP allowed during ladder search |
 | `--max-qp` | `40` | Maximum QP allowed during ladder search |

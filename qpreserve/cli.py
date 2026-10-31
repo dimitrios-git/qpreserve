@@ -431,6 +431,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              'Guide: ultra=near-lossless, high=clean, medium=compressed, low=heavily compressed, lower=very heavily compressed.'
     )
     parser.add_argument(
+        '--tier-offset',
+        type=int,
+        metavar='N',
+        help='Without --source-quality: start from the tier the source heuristic suggests, '
+             'lowered by N levels (1: ultra->high, high->medium, ...; negative raises it). '
+             'Applies per file, and per cluster in batch mode; non-interactive single-file runs '
+             'then use the heuristic instead of defaulting to medium.'
+    )
+    parser.add_argument(
         '--expected-min-gain',
         type=float,
         default=1.0,
@@ -1204,6 +1213,17 @@ def _tier_for_bppf(codec: str, bppf: float) -> str:
     return "lower"
 
 
+def _offset_tier(tier: str, offset: int | None) -> str:
+    """The tier `offset` levels below `tier` (above, if negative), kept within ultra..lower."""
+    if not offset:
+        return tier
+    try:
+        idx = _TIER_ORDER.index(tier.lower())
+    except ValueError:
+        return tier
+    return _TIER_ORDER[max(0, min(len(_TIER_ORDER) - 1, idx + offset))]
+
+
 def _next_lower_tier(tier: str) -> str | None:
     """Return the next lower quality tier, or None if already at the lowest."""
     try:
@@ -1362,7 +1382,7 @@ def _ensure_source_quality_for_default_pipeline(config: EncodeConfig) -> bool:
         return True
     if config.batch_mode:
         return True
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() and config.tier_offset is None:
         config.source_quality = "medium"
         print("No --source-quality provided; defaulting to 'medium' in non-interactive mode.")
         return True
@@ -1377,6 +1397,14 @@ def _ensure_source_quality_for_default_pipeline(config: EncodeConfig) -> bool:
         height=height,
         raw_fr=fps,
     )
+
+    if config.tier_offset is not None:
+        chosen = _offset_tier(advised, config.tier_offset)
+        print(f"Heuristic tier '{advised}', --tier-offset {config.tier_offset}: using '{chosen}'.")
+        if not sys.stdin.isatty():
+            config.source_quality = chosen
+            return True
+        advised = chosen
 
     default_choice = _default_choice_for_tier(advised)
     _print_source_quality_menu(default_choice)
@@ -2608,7 +2636,7 @@ def _run_batch_auto(config: EncodeConfig) -> None:
         # Track whether the tier was auto-detected so we know whether to retry.
         heuristic_tier = not bool(config.source_quality)
         initial_tier = (
-            _tier_for_bppf(str(rep["codec"]), float(rep["bppf"]))
+            _offset_tier(_tier_for_bppf(str(rep["codec"]), float(rep["bppf"])), config.tier_offset)
             if heuristic_tier
             else str(config.source_quality)
         )
